@@ -1,0 +1,1120 @@
+diff --git a/node_modules/react-native-callkeep/ios/RNCallKeep/RNCallKeep.m b/node_modules/react-native-callkeep/ios/RNCallKeep/RNCallKeep.m
+index 786045f..4650096 100644
+--- a/node_modules/react-native-callkeep/ios/RNCallKeep/RNCallKeep.m
++++ b/node_modules/react-native-callkeep/ios/RNCallKeep/RNCallKeep.m
+@@ -17,6 +17,183 @@
+ #import <AVFoundation/AVAudioSession.h>
+ #import <CallKit/CallKit.h>
+ 
++/** Filter Xcode / Console.app with: VOXO_CK — correlates CallKit UI timer issues across sequential outbound calls. */
++static void VoxoCKLogCalls(NSString *tag, NSString *focusUuid)
++{
++    CXCallObserver *obs = [[CXCallObserver alloc] init];
++    NSLog(@"[VOXO_CK] %@ focus=%@ observer.callCount=%lu main=%d",
++          tag,
++          focusUuid ?: @"(nil)",
++          (unsigned long)obs.calls.count,
++          [NSThread isMainThread]);
++    for (CXCall *call in obs.calls) {
++        NSLog(@"[VOXO_CK]   uuid=%@ hasConnected=%d",
++              call.UUID.UUIDString,
++              call.hasConnected);
++    }
++}
++
++static void VoxoCKLogCallsDeferred(NSString *tag, NSString *focusUuid)
++{
++    dispatch_async(dispatch_get_main_queue(), ^{
++        VoxoCKLogCalls([NSString stringWithFormat:@"%@ (deferred)", tag], focusUuid);
++    });
++}
++
++static NSString *voxoRKTrim(NSString *s)
++{
++    return s ? [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]] : @"";
++}
++
++/// Phone → Recents sometimes leaves `personHandle.value` empty but fills `phoneNumbers`.
++/// Use KVC for `phoneNumbers` / `phoneNumber` so this compiles when Intents headers omit typed properties.
++static NSString *VoxoRKDialableHandleFromINPerson(INPerson *person)
++{
++    if (person == nil) {
++        return nil;
++    }
++    INPersonHandle *ph = person.personHandle;
++    NSString *fromHandle = voxoRKTrim(ph.value);
++    if (fromHandle.length > 0) {
++        return fromHandle;
++    }
++    @try {
++        id phones = [person valueForKey:@"phoneNumbers"];
++        if ([phones isKindOfClass:[NSArray class]]) {
++            for (id pn in (NSArray *)phones) {
++                if (pn == nil) {
++                    continue;
++                }
++                id rawNum = [pn valueForKey:@"phoneNumber"];
++                NSString *num = voxoRKTrim([rawNum isKindOfClass:[NSString class]] ? rawNum : [rawNum description]);
++                if (num.length > 0) {
++                    return num;
++                }
++            }
++        }
++    } @catch (__unused NSException *e) {
++    }
++    return nil;
++}
++
++/// Best-effort display name from Recents / Siri `INPerson` (for CallKit `localizedCallerName` + JS `name`).
++static NSString *VoxoRKDisplayNameFromINPerson(INPerson *person)
++{
++    if (person == nil) {
++        return @"";
++    }
++    NSString *dn = voxoRKTrim(person.displayName);
++    if (dn.length > 0) {
++        return dn;
++    }
++    @try {
++        NSString *nick = voxoRKTrim([person valueForKey:@"nickname"]);
++        if (nick.length > 0) {
++            return nick;
++        }
++    } @catch (__unused NSException *e) {
++    }
++    if (@available(iOS 12.0, *)) {
++        NSPersonNameComponents *nc = person.nameComponents;
++        if (nc != nil) {
++            NSPersonNameComponentsFormatter *fmt = [[NSPersonNameComponentsFormatter alloc] init];
++            fmt.style = NSPersonNameComponentsFormatterStyleDefault;
++            NSString *formatted = voxoRKTrim([fmt stringFromPersonNameComponents:nc]);
++            if (formatted.length > 0) {
++                return formatted;
++            }
++        }
++    }
++    @try {
++        NSString *gn = voxoRKTrim([person valueForKey:@"givenName"]);
++        NSString *fn = voxoRKTrim([person valueForKey:@"familyName"]);
++        NSMutableArray *parts = [NSMutableArray array];
++        if (gn.length > 0) {
++            [parts addObject:gn];
++        }
++        if (fn.length > 0) {
++            [parts addObject:fn];
++        }
++        if (parts.count > 0) {
++            return [parts componentsJoinedByString:@" "];
++        }
++    } @catch (__unused NSException *e) {
++    }
++    return @"";
++}
++
++/// Scan every contact on audio / video / generic start-call intents.
++static NSString *VoxoRKDialableHandleFromStartCallIntent(INIntent *intent)
++{
++    if (intent == nil) {
++        return nil;
++    }
++    if ([intent isKindOfClass:[INStartAudioCallIntent class]]) {
++        for (INPerson *p in ((INStartAudioCallIntent *)intent).contacts) {
++            NSString *h = VoxoRKDialableHandleFromINPerson(p);
++            if (h.length > 0) {
++                return h;
++            }
++        }
++    } else if ([intent isKindOfClass:[INStartVideoCallIntent class]]) {
++        for (INPerson *p in ((INStartVideoCallIntent *)intent).contacts) {
++            NSString *h = VoxoRKDialableHandleFromINPerson(p);
++            if (h.length > 0) {
++                return h;
++            }
++        }
++    }
++    if ([intent isKindOfClass:[INStartCallIntent class]]) {
++        for (INPerson *p in ((INStartCallIntent *)intent).contacts) {
++            NSString *h = VoxoRKDialableHandleFromINPerson(p);
++            if (h.length > 0) {
++                return h;
++            }
++        }
++    }
++    return nil;
++}
++
++static BOOL voxoRKTitleLooksDialable(NSString *title)
++{
++    NSString *t = voxoRKTrim(title);
++    if (t.length < 3 || t.length > 40) {
++        return NO;
++    }
++    NSCharacterSet *allowed = [NSCharacterSet characterSetWithCharactersInString:@"+0123456789 *#()-."];
++    NSCharacterSet *inverted = [allowed invertedSet];
++    return [t rangeOfCharacterFromSet:inverted].location == NSNotFound;
++}
++
++/** Survives Metro delay / killed launch — JS reads via popPendingRecentsIntent. */
++static NSString *const kVoxoPendingRecentsHandleKey = @"VoxoPendingRecentsHandle";
++static NSString *const kVoxoPendingRecentsUUIDKey = @"VoxoPendingRecentsUUID";
++static NSString *const kVoxoPendingRecentsTsKey = @"VoxoPendingRecentsTs";
++static NSString *const kVoxoPendingRecentsDisplayNameKey = @"VoxoPendingRecentsDisplayName";
++
++static void VoxoStashPendingRecentsFromPhoneApp(NSString *handle, NSString *uuidString, NSString *displayName)
++{
++    if (handle.length == 0 || uuidString.length == 0) {
++        return;
++    }
++    NSString *uuidLower = [uuidString lowercaseString];
++    NSString *dn = voxoRKTrim(displayName);
++    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
++    [d setObject:handle forKey:kVoxoPendingRecentsHandleKey];
++    [d setObject:uuidLower forKey:kVoxoPendingRecentsUUIDKey];
++    [d setDouble:[[NSDate date] timeIntervalSince1970] forKey:kVoxoPendingRecentsTsKey];
++    if (dn.length > 0) {
++        [d setObject:dn forKey:kVoxoPendingRecentsDisplayNameKey];
++    } else {
++        [d removeObjectForKey:kVoxoPendingRecentsDisplayNameKey];
++    }
++    [d synchronize];
++    NSLog(@"[VOXO_CK] voxoStashPendingRecents handle=%@ uuid=%@ nameLen=%lu",
++          handle,
++          uuidLower,
++          (unsigned long)dn.length);
++}
++
+ #ifdef DEBUG
+ static int const OUTGOING_CALL_WAKEUP_DELAY = 10;
+ #else
+@@ -45,6 +222,14 @@ @implementation RNCallKeep
+     bool _hasListeners;
+     bool _isReachable;
+     NSMutableArray *_delayedEvents;
++    /** UUIDs (uppercase) from Recents/Siri `continueUserActivity` — CXEndCallAction often returns Code=4; end via report only. */
++    NSMutableSet<NSString *> *_systemInitiatedCallUUIDs;
++    /** Last display + E.164 handle to merge into CXCallUpdate immediately before report ended (Phone → Recents snapshot). */
++    NSMutableDictionary<NSString *, NSDictionary *> *_voxoRecentsEndSnapshotByUuid;
++    /** `continueUserActivity` → `performStartCallAction`: INPerson name + dial handle keyed by CallKit UUID (uppercase). */
++    NSMutableDictionary<NSString *, NSDictionary *> *_voxoRecentsIntentPayloadByUuid;
++    /** One pending CXProvider rebuild — avoids invalidating a freshly recycled provider. */
++    BOOL _voxoRecycleScheduled;
+ }
+ 
+ static bool isSetupNatively;
+@@ -62,6 +247,9 @@ - (instancetype)init
+         _isStartCallActionEventListenerAdded = NO;
+         _isReachable = NO;
+         if (_delayedEvents == nil) _delayedEvents = [NSMutableArray array];
++        _systemInitiatedCallUUIDs = [NSMutableSet set];
++        _voxoRecentsEndSnapshotByUuid = [NSMutableDictionary dictionary];
++        _voxoRecentsIntentPayloadByUuid = [NSMutableDictionary dictionary];
+ 
+         [[NSNotificationCenter defaultCenter] addObserver:self
+                                                  selector:@selector(onAudioRouteChange:)
+@@ -148,7 +336,7 @@ - (void)onAudioRouteChange:(NSNotification *)notification
+ {
+     NSDictionary *info = notification.userInfo;
+     NSInteger reason = [[info valueForKey:AVAudioSessionRouteChangeReasonKey] integerValue];
+-    NSString *output = [RNCallKeep getAudioOutput];
++    NSString *output = [RNCallKeep getSelectedAudioRoute];
+ 
+     if (output == nil) {
+         return;
+@@ -268,10 +456,50 @@ + (void)setup:(NSDictionary *)options {
+ #ifdef DEBUG
+     NSLog(@"[RNCallKeep][checkSpeaker]");
+ #endif
+-    NSString *output = [RNCallKeep getAudioOutput];
++    NSString *output = [RNCallKeep getSelectedAudioRoute];
+     resolve(@([output isEqualToString:@"Speaker"]));
+ }
+ 
++RCT_REMAP_METHOD(popPendingRecentsIntent,
++                 popPendingRecentsIntentWithResolver:(RCTPromiseResolveBlock)resolve
++                 rejecter:(RCTPromiseRejectBlock)reject)
++{
++    NSUserDefaults *d = [NSUserDefaults standardUserDefaults];
++    NSString *handle = [d stringForKey:kVoxoPendingRecentsHandleKey];
++    NSString *uuid = [d stringForKey:kVoxoPendingRecentsUUIDKey];
++    NSTimeInterval ts = [d doubleForKey:kVoxoPendingRecentsTsKey];
++    NSString *pendingName = voxoRKTrim([d stringForKey:kVoxoPendingRecentsDisplayNameKey]);
++    [d removeObjectForKey:kVoxoPendingRecentsHandleKey];
++    [d removeObjectForKey:kVoxoPendingRecentsUUIDKey];
++    [d removeObjectForKey:kVoxoPendingRecentsTsKey];
++    [d removeObjectForKey:kVoxoPendingRecentsDisplayNameKey];
++    [d synchronize];
++
++    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
++    const NSTimeInterval kMaxAgeSeconds = 180.0;
++    if (handle.length > 0 && uuid.length > 0 && (now - ts) <= kMaxAgeSeconds) {
++        NSLog(@"[VOXO_CK] popPendingRecentsIntent → JS handle=%@ uuid=%@ nameLen=%lu age=%.2fs",
++              handle,
++              uuid,
++              (unsigned long)pendingName.length,
++              now - ts);
++        NSMutableDictionary *out = [@{
++            @"handle": handle,
++            @"callUUID": uuid
++        } mutableCopy];
++        if (pendingName.length > 0) {
++            out[@"name"] = pendingName;
++        }
++        resolve(out);
++    } else {
++        NSLog(@"[VOXO_CK] popPendingRecentsIntent → empty/stale (hLen=%lu uLen=%lu age=%.2fs)",
++              (unsigned long)handle.length,
++              (unsigned long)uuid.length,
++              (handle.length > 0 && uuid.length > 0) ? (now - ts) : -1.0);
++        resolve([NSNull null]);
++    }
++}
++
+ #pragma mark - CXCallController call actions
+ 
+ // Display the incoming call to the user
+@@ -343,6 +571,11 @@ + (void)setup:(NSDictionary *)options {
+     int _handleType = [RNCallKeep getHandleType:handleType];
+     NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:uuidString];
+     CXHandle *callHandle = [[CXHandle alloc] initWithType:_handleType value:handle];
++    NSLog(@"[VOXO_RECENTS_CK] startCall(from JS) uuid=%@ handleLen=%lu cxHandleType=%ld arg=%@",
++          uuid != nil ? uuid.UUIDString : @"(bad-uuid)",
++          (unsigned long)(handle ? handle.length : 0),
++          (long)_handleType,
++          handleType ?: @"(nil)");
+     CXStartCallAction *startCallAction = [[CXStartCallAction alloc] initWithCallUUID:uuid handle:callHandle];
+     [startCallAction setVideo:video];
+     [startCallAction setContactIdentifier:contactIdentifier];
+@@ -365,18 +598,155 @@ + (void)setup:(NSDictionary *)options {
+     [self requestTransaction:transaction];
+ }
+ 
++/// Recreate CXProvider after calls end so subsequent starts receive performStartCallAction reliably.
++- (void)voxoRecycleCallKitProviderNow
++{
++    NSDictionary *settings = [RNCallKeep getSettings];
++    if (settings == nil) {
++        NSLog(@"[VOXO_CK] voxoRecycleCallKitProviderNow: no RNCallKeepSettings — abort");
++        return;
++    }
++    if (sharedProvider != nil) {
++        [sharedProvider invalidate];
++        sharedProvider = nil;
++    }
++    sharedProvider = [[CXProvider alloc] initWithConfiguration:[RNCallKeep getProviderConfiguration:settings]];
++    RNCallKeep *singleton = [RNCallKeep allocWithZone:nil];
++    singleton.callKeepProvider = sharedProvider;
++    [sharedProvider setDelegate:singleton queue:nil];
++    NSLog(@"[VOXO_CK] voxoRecycleCallKitProviderNow: rebuilt CXProvider + delegate");
++}
++
++- (void)voxoPerformRecycleWithRetries:(NSUInteger)retriesLeft
++{
++    CXCallObserver *obs = [[CXCallObserver alloc] init];
++    if (obs.calls.count == 0) {
++        [self voxoRecycleCallKitProviderNow];
++        self->_voxoRecycleScheduled = NO;
++        return;
++    }
++    if (retriesLeft == 0) {
++        NSLog(@"[VOXO_CK] voxoRecycle: CXCallObserver still has %lu call(s) — skipping recycle",
++              (unsigned long)obs.calls.count);
++        self->_voxoRecycleScheduled = NO;
++        return;
++    }
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.35 * NSEC_PER_SEC)),
++                   dispatch_get_main_queue(), ^{
++        [self voxoPerformRecycleWithRetries:retriesLeft - 1];
++    });
++}
++
++/// Schedule provider recycle once CallKit observer shows no active calls.
++- (void)voxoScheduleRecycleAfterCallEnded
++{
++    if (_voxoRecycleScheduled) {
++        NSLog(@"[VOXO_CK] voxoScheduleRecycleAfterCallEnded: already scheduled — skip");
++        return;
++    }
++    _voxoRecycleScheduled = YES;
++    // Defer recycle so Phone → Recents can finish associating the ended call with this app
++    // before CXProvider is torn down (helps tap-to-return from Recents).
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
++                   dispatch_get_main_queue(), ^{
++        [self voxoPerformRecycleWithRetries:6];
++    });
++}
++
++/// Report call ended without CXEndCallAction (same semantics as Code=4 fallback).
++- (void)voxoReportEndedDirectly:(NSUUID *)uuid
++{
++    CXProvider *provider = sharedProvider != nil ? sharedProvider : self.callKeepProvider;
++    if (provider == nil) {
++        NSLog(@"[VOXO_CK] voxoReportEndedDirectly: no provider uuid=%@", uuid.UUIDString);
++        return;
++    }
++    __weak typeof(self) weakSelf = self;
++    dispatch_async(dispatch_get_main_queue(), ^{
++        [provider reportCallWithUUID:uuid endedAtDate:[NSDate date] reason:CXCallEndedReasonRemoteEnded];
++        NSLog(@"[VOXO_CK] reportEndedDirectly done uuid=%@", uuid.UUIDString);
++
++        RNCallKeep *innerSelf = weakSelf;
++        if (innerSelf != nil) {
++            [innerSelf voxoScheduleRecycleAfterCallEnded];
++        }
++    });
++}
++
+ RCT_EXPORT_METHOD(endCall:(NSString *)uuidString)
+ {
+ #ifdef DEBUG
+     NSLog(@"[RNCallKeep][endCall] uuidString = %@", uuidString);
+ #endif
++    NSLog(@"[VOXO_CK] endCall before requestTransaction uuid=%@ (checking CXCallController observer)", uuidString);
++    VoxoCKLogCalls(@"endCall pre-transaction", uuidString);
++
+     NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:uuidString];
++    if (uuid == nil) {
++        NSLog(@"[VOXO_CK] endCall: invalid UUID string — abort");
++        return;
++    }
++
++    NSString *uuidKey = uuid.UUIDString.uppercaseString;
++
++    [self voxoApplyStoredRecentsSnapshotBeforeEndForUuid:uuid];
++
++    if ([_systemInitiatedCallUUIDs containsObject:uuidKey]) {
++        NSLog(@"[VOXO_CK] endCall: system-initiated (Recents/Siri) UUID — skip CXEndCallAction, report ended uuid=%@", uuidKey);
++        [_systemInitiatedCallUUIDs removeObject:uuidKey];
++        [self voxoReportEndedDirectly:uuid];
++        return;
++    }
++
++    if (self.callKeepCallController == nil) {
++        self.callKeepCallController = [[CXCallController alloc] init];
++    }
++
++    CXCall *matchingCall = nil;
++    for (CXCall *call in self.callKeepCallController.callObserver.calls) {
++        if ([call.UUID isEqual:uuid]) {
++            matchingCall = call;
++            break;
++        }
++    }
++
++    if (matchingCall == nil) {
++        NSLog(@"[VOXO_CK] endCall: UUID not in controller observer — skip CXEndCallAction, report ended uuid=%@", uuid.UUIDString);
++        [self voxoReportEndedDirectly:uuid];
++        return;
++    }
++
++    if (matchingCall.hasEnded) {
++        NSLog(@"[VOXO_CK] endCall: observer shows hasEnded — skip CXEndCallAction uuid=%@", uuid.UUIDString);
++        return;
++    }
++
+     CXEndCallAction *endCallAction = [[CXEndCallAction alloc] initWithCallUUID:uuid];
+     CXTransaction *transaction = [[CXTransaction alloc] initWithAction:endCallAction];
+ 
+     [self requestTransaction:transaction];
+ }
+ 
++RCT_EXPORT_METHOD(setCallRecentsEndSnapshot:(NSString *)uuidString :(NSString *)displayName :(NSString *)handleUri)
++{
++    NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:uuidString];
++    if (uuid == nil) {
++        NSLog(@"[VOXO_RECENTS_CK] setCallRecentsEndSnapshot ABORT invalid uuid");
++        return;
++    }
++    NSString *key = uuid.UUIDString.uppercaseString;
++    @synchronized (self) {
++        _voxoRecentsEndSnapshotByUuid[key] = @{
++            @"displayName": displayName ?: @"",
++            @"handle": handleUri ?: @""
++        };
++    }
++    NSLog(@"[VOXO_RECENTS_CK] setCallRecentsEndSnapshot STORED uuid=%@ nameLen=%lu handleLen=%lu",
++          key,
++          (unsigned long)voxoRKTrim(displayName).length,
++          (unsigned long)voxoRKTrim(handleUri).length);
++}
++
+ RCT_EXPORT_METHOD(endAllCalls)
+ {
+ #ifdef DEBUG
+@@ -410,13 +780,46 @@ + (void)setup:(NSDictionary *)options {
+ RCT_EXPORT_METHOD(reportConnectingOutgoingCallWithUUID:(NSString *)uuidString)
+ {
+     NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:uuidString];
+-    [self.callKeepProvider reportOutgoingCallWithUUID:uuid startedConnectingAtDate:[NSDate date]];
++    if (uuid == nil) {
++        NSLog(@"[VOXO_CK] reportConnecting FAILED parse uuidString=%@", uuidString);
++        return;
++    }
++    NSLog(@"[VOXO_CK] reportConnecting ENTER uuid=%@", uuid.UUIDString);
++    VoxoCKLogCalls(@"before reportConnecting", uuid.UUIDString);
++    NSUUID *uuidCopy = uuid;
++    void (^reportBlock)(void) = ^{
++        [self.callKeepProvider reportOutgoingCallWithUUID:uuidCopy startedConnectingAtDate:[NSDate date]];
++        VoxoCKLogCalls(@"after reportConnecting", uuidCopy.UUIDString);
++        NSLog(@"[VOXO_CK] reportConnecting DONE uuid=%@", uuidCopy.UUIDString);
++    };
++    if ([NSThread isMainThread]) {
++        reportBlock();
++    } else {
++        dispatch_sync(dispatch_get_main_queue(), reportBlock);
++    }
+ }
+ 
+ RCT_EXPORT_METHOD(reportConnectedOutgoingCallWithUUID:(NSString *)uuidString)
+ {
+     NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:uuidString];
+-    [self.callKeepProvider reportOutgoingCallWithUUID:uuid connectedAtDate:[NSDate date]];
++    if (uuid == nil) {
++        NSLog(@"[VOXO_CK] reportConnected FAILED parse uuidString=%@", uuidString);
++        return;
++    }
++    NSLog(@"[VOXO_CK] reportConnected ENTER uuid=%@", uuid.UUIDString);
++    VoxoCKLogCalls(@"before reportConnected", uuid.UUIDString);
++    NSUUID *uuidCopy = uuid;
++    void (^reportBlock)(void) = ^{
++        [self.callKeepProvider reportOutgoingCallWithUUID:uuidCopy connectedAtDate:[NSDate date]];
++        VoxoCKLogCalls(@"after reportConnected", uuidCopy.UUIDString);
++        NSLog(@"[VOXO_CK] reportConnected DONE uuid=%@", uuidCopy.UUIDString);
++        VoxoCKLogCallsDeferred(@"post-connected observer", uuidCopy.UUIDString);
++    };
++    if ([NSThread isMainThread]) {
++        reportBlock();
++    } else {
++        dispatch_sync(dispatch_get_main_queue(), reportBlock);
++    }
+ }
+ 
+ RCT_EXPORT_METHOD(reportEndCallWithUUID:(NSString *)uuidString :(int)reason)
+@@ -424,16 +827,130 @@ + (void)setup:(NSDictionary *)options {
+     [RNCallKeep endCallWithUUID: uuidString reason:reason];
+ }
+ 
++/** Strict E.164, or short numeric PBX extension (3–8 digits) for Phone → Recents "Phone" row. */
++static CXHandleType VoxoCallKeepHandleTypeForUpdateDisplayUri(NSString *uri)
++{
++    NSString *t = [(uri ?: @"") stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
++    if (t.length == 0) {
++        return CXHandleTypeGeneric;
++    }
++    NSString *lower = t.lowercaseString;
++    if ([lower hasPrefix:@"sip:"] || [lower containsString:@"@"]) {
++        return CXHandleTypeGeneric;
++    }
++    // Strict E.164: leading + then digits only (ITU-T max 15 digits after +).
++    if ([t hasPrefix:@"+"] && t.length >= 9 && t.length <= 16) {
++        BOOL e164Ok = YES;
++        for (NSUInteger i = 1; i < t.length; i++) {
++            unichar c = [t characterAtIndex:i];
++            if (c < '0' || c > '9') {
++                e164Ok = NO;
++                break;
++            }
++        }
++        if (e164Ok) {
++            return CXHandleTypePhoneNumber;
++        }
++    }
++    // PBX extension (e.g. 1015): digits only, short — fills Phone field like PSTN rows; redial goes through app.
++    if (t.length >= 3 && t.length <= 8) {
++        BOOL allDigit = YES;
++        for (NSUInteger i = 0; i < t.length; i++) {
++            unichar c = [t characterAtIndex:i];
++            if (c < '0' || c > '9') {
++                allDigit = NO;
++                break;
++            }
++        }
++        if (allDigit) {
++            return CXHandleTypePhoneNumber;
++        }
++    }
++    return CXHandleTypeGeneric;
++}
++
++/// Final CXCallUpdate merged into the call record Phone.app archives (apply immediately before ended).
++static void VoxoApplyRecentsEndSnapshotIfNeeded(CXProvider *provider, NSUUID *uuid, NSString *displayName, NSString *handleUri)
++{
++    if (provider == nil || uuid == nil) {
++        return;
++    }
++    NSString *dn = voxoRKTrim(displayName);
++    NSString *uri = voxoRKTrim(handleUri);
++    if (dn.length == 0 && uri.length == 0) {
++        NSLog(@"[VOXO_RECENTS_CK] pre-end snapshot skip (empty) uuid=%@", uuid.UUIDString);
++        return;
++    }
++    CXCallUpdate *callUpdate = [[CXCallUpdate alloc] init];
++    if (dn.length > 0) {
++        callUpdate.localizedCallerName = dn;
++    }
++    CXHandleType ht = VoxoCallKeepHandleTypeForUpdateDisplayUri(uri);
++    if (ht == CXHandleTypePhoneNumber) {
++        callUpdate.remoteHandle = [[CXHandle alloc] initWithType:CXHandleTypePhoneNumber value:uri];
++    }
++    if (callUpdate.localizedCallerName.length > 0 || callUpdate.remoteHandle != nil) {
++        [provider reportCallWithUUID:uuid updated:callUpdate];
++        NSLog(@"[VOXO_RECENTS_CK] pre-end snapshot uuid=%@ nameApplied=%d phoneApplied=%d",
++              uuid.UUIDString,
++              (int)(callUpdate.localizedCallerName.length > 0),
++              (int)(callUpdate.remoteHandle != nil));
++    } else {
++        NSLog(@"[VOXO_RECENTS_CK] pre-end snapshot skip (no applicable fields) uuid=%@", uuid.UUIDString);
++    }
++}
++
++- (void)voxoApplyStoredRecentsSnapshotBeforeEndForUuid:(NSUUID *)uuid
++{
++    NSString *key = uuid.UUIDString.uppercaseString;
++    NSDictionary *snap = nil;
++    @synchronized (self) {
++        snap = _voxoRecentsEndSnapshotByUuid[key];
++        if (snap != nil) {
++            [_voxoRecentsEndSnapshotByUuid removeObjectForKey:key];
++        }
++    }
++    if (snap == nil) {
++        return;
++    }
++    NSString *dn = voxoRKTrim([snap objectForKey:@"displayName"]);
++    NSString *handle = voxoRKTrim([snap objectForKey:@"handle"]);
++    void (^apply)(void) = ^{
++        CXProvider *provider = sharedProvider != nil ? sharedProvider : self.callKeepProvider;
++        VoxoApplyRecentsEndSnapshotIfNeeded(provider, uuid, dn, handle);
++    };
++    if ([NSThread isMainThread]) {
++        apply();
++    } else {
++        dispatch_sync(dispatch_get_main_queue(), apply);
++    }
++}
++
+ RCT_EXPORT_METHOD(updateDisplay:(NSString *)uuidString :(NSString *)displayName :(NSString *)uri :(NSDictionary *)options)
+ {
+ #ifdef DEBUG
+     NSLog(@"[RNCallKeep][updateDisplay] uuidString = %@ displayName = %@ uri = %@", uuidString, displayName, uri);
+ #endif
+     NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:uuidString];
+-    CXHandle *callHandle = [[CXHandle alloc] initWithType:CXHandleTypePhoneNumber value:uri];
++    if (uuid == nil) {
++        return;
++    }
++    CXHandleType handleType = VoxoCallKeepHandleTypeForUpdateDisplayUri(uri);
+     CXCallUpdate *callUpdate = [[CXCallUpdate alloc] init];
+     callUpdate.localizedCallerName = displayName;
+-    callUpdate.remoteHandle = callHandle;
++    // E.164 or short PBX extension (3–8 digits): Phone → Recents shows a Phone row.
++    if (handleType == CXHandleTypePhoneNumber) {
++        callUpdate.remoteHandle = [[CXHandle alloc] initWithType:CXHandleTypePhoneNumber value:uri];
++    }
++    NSLog(@"[VOXO_RECENTS_CK] updateDisplay uuid=%@ nameLen=%lu remoteHandleSet=%d uriPrefix=%.32s",
++          uuid.UUIDString,
++          (unsigned long)(displayName.length),
++          (int)(handleType == CXHandleTypePhoneNumber),
++          (uri != nil && uri.UTF8String != NULL) ? uri.UTF8String : "(nil)");
++#ifdef DEBUG
++    NSLog(@"[RNCallKeep][updateDisplay] remoteHandle type=%ld uri=%@",
++          (long)handleType, uri);
++#endif
+ 
+     if ([options valueForKey:@"hasVideo"] != nil) {
+         callUpdate.hasVideo = [RCTConvert BOOL:options[@"hasVideo"]];
+@@ -451,7 +968,9 @@ + (void)setup:(NSDictionary *)options {
+         callUpdate.supportsUngrouping = [RCTConvert BOOL:options[@"supportsUngrouping"]];
+     }
+ 
+-    [self.callKeepProvider reportCallWithUUID:uuid updated:callUpdate];
++    dispatch_async(dispatch_get_main_queue(), ^{
++        [self.callKeepProvider reportCallWithUUID:uuid updated:callUpdate];
++    });
+ }
+ 
+ RCT_EXPORT_METHOD(setMutedCall:(NSString *)uuidString :(BOOL)muted)
+@@ -473,7 +992,8 @@ + (void)setup:(NSDictionary *)options {
+     NSLog(@"[RNCallKeep][sendDTMF] key = %@", key);
+ #endif
+     NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:uuidString];
+-    CXPlayDTMFCallAction *dtmfAction = [[CXPlayDTMFCallAction alloc] initWithCallUUID:uuid digits:key type:CXPlayDTMFCallActionTypeHardPause];
++    // SingleTone plays standard DTMF (and local keypress feedback). HardPause is for dial-string pauses, not tones.
++    CXPlayDTMFCallAction *dtmfAction = [[CXPlayDTMFCallAction alloc] initWithCallUUID:uuid digits:key type:CXPlayDTMFCallActionTypeSingleTone];
+     CXTransaction *transaction = [[CXTransaction alloc] init];
+     [transaction addAction:dtmfAction];
+ 
+@@ -524,6 +1044,15 @@ + (void)setup:(NSDictionary *)options {
+             return;
+         }
+ 
++        if ([inputName isEqualToString:@"Phone"] || [inputName isEqualToString:@"Receiver"]) {
++            BOOL isOverrided = [myAudioSession overrideOutputAudioPort:AVAudioSessionPortOverrideNone error:&err];
++            if(!isOverrided){
++                [NSException raise:@"overrideOutputAudioPort failed" format:@"error: %@", err];
++            }
++            resolve(@"Phone");
++            return;
++        }
++
+         NSArray *ports = [RNCallKeep getAudioInputs];
+         for (AVAudioSessionPortDescription *port in ports) {
+             if ([port.portName isEqualToString:inputName]) {
+@@ -655,12 +1184,20 @@ + (NSString *) getSelectedAudioRoute
+     AVAudioSessionRouteDescription *currentRoute = [myAudioSession currentRoute];
+     NSArray *selectedOutputs = currentRoute.outputs;
+ 
++    if (selectedOutputs == nil || selectedOutputs.count == 0) {
++        return nil;
++    }
++
+     AVAudioSessionPortDescription *selectedOutput = selectedOutputs[0];
+ 
+     if(selectedOutput && [selectedOutput.portType isEqualToString:AVAudioSessionPortBuiltInReceiver]) {
+         return @"Phone";
+     }
+ 
++    if (selectedOutput == nil) {
++        return nil;
++    }
++
+     return [RNCallKeep getAudioInputType: selectedOutput.portType];
+ }
+ 
+@@ -675,21 +1212,42 @@ - (void)requestTransaction:(CXTransaction *)transaction
+     [self.callKeepCallController requestTransaction:transaction completion:^(NSError * _Nullable error) {
+         if (error != nil) {
+             NSLog(@"[RNCallKeep][requestTransaction] Error requesting transaction (%@): (%@)", transaction.actions, error);
++
++            // CXEndCallAction + Code 4 (CXErrorCodeRequestTransactionUnknownCallUUID): transaction path invalid;
++            // SIP/app may already have torn down while CallKit UI still shows active — fall back to report ended.
++            id firstAction = [transaction.actions firstObject];
++            if ([firstAction isKindOfClass:[CXEndCallAction class]]) {
++                CXEndCallAction *endAction = (CXEndCallAction *)firstAction;
++                NSString *domain = error.domain ?: @"";
++                BOOL isCallKitTxnDomain =
++                    [domain isEqualToString:@"com.apple.CallKit.error.requesttransaction"];
++                if (isCallKitTxnDomain && error.code == 4) {
++                    NSUUID *uuid = endAction.callUUID;
++                    CXProvider *provider = sharedProvider != nil ? sharedProvider : self.callKeepProvider;
++                    if (provider != nil && uuid != nil) {
++                        NSLog(@"[RNCallKeep][requestTransaction] CXEndCallAction Code=4 — fallback reportCall ended uuid=%@", uuid.UUIDString);
++                        __weak RNCallKeep *weakSelf = self;
++                        dispatch_async(dispatch_get_main_queue(), ^{
++                            [provider reportCallWithUUID:uuid endedAtDate:[NSDate date] reason:CXCallEndedReasonRemoteEnded];
++                            RNCallKeep *inner = weakSelf;
++                            if (inner != nil) {
++                                [inner voxoScheduleRecycleAfterCallEnded];
++                            }
++                        });
++                    }
++                }
++            }
+         } else {
+             NSLog(@"[RNCallKeep][requestTransaction] Requested transaction successfully");
+-
+-            // CXStartCallAction
++            // Do NOT call reportCallWithUUID(updated) here for CXStartCallAction. Doing so in the
++            // transaction completion handler (before performStartCallAction / fulfill) can prevent
++            // CallKit from invoking performStartCallAction on subsequent Recents/Siri starts.
++            // The same update runs after fulfill in provider:performStartCallAction: below.
+             if ([[transaction.actions firstObject] isKindOfClass:[CXStartCallAction class]]) {
+                 CXStartCallAction *startCallAction = [transaction.actions firstObject];
+-                CXCallUpdate *callUpdate = [[CXCallUpdate alloc] init];
+-                callUpdate.remoteHandle = startCallAction.handle;
+-                callUpdate.hasVideo = startCallAction.video;
+-                callUpdate.localizedCallerName = startCallAction.contactIdentifier;
+-                callUpdate.supportsDTMF = YES;
+-                callUpdate.supportsHolding = YES;
+-                callUpdate.supportsGrouping = YES;
+-                callUpdate.supportsUngrouping = YES;
+-                [self.callKeepProvider reportCallWithUUID:startCallAction.callUUID updated:callUpdate];
++                NSLog(@"[VOXO_CK] requestTransaction OK CXStartCallAction uuid=%@", startCallAction.callUUID.UUIDString);
++            } else if ([[transaction.actions firstObject] isKindOfClass:[CXEndCallAction class]]) {
++                [self voxoScheduleRecycleAfterCallEnded];
+             }
+         }
+     }];
+@@ -737,25 +1295,42 @@ + (void)endCallWithUUID:(NSString *)uuidString
+     NSLog(@"[RNCallKeep][reportEndCallWithUUID] uuidString = %@ reason = %d", uuidString, reason);
+ #endif
+     NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:uuidString];
+-    switch (reason) {
+-        case 1:
+-            [sharedProvider reportCallWithUUID:uuid endedAtDate:[NSDate date] reason:CXCallEndedReasonFailed];
+-            break;
+-        case 2:
+-        case 6:
+-            [sharedProvider reportCallWithUUID:uuid endedAtDate:[NSDate date] reason:CXCallEndedReasonRemoteEnded];
+-            break;
+-        case 3:
+-            [sharedProvider reportCallWithUUID:uuid endedAtDate:[NSDate date] reason:CXCallEndedReasonUnanswered];
+-            break;
+-        case 4:
+-            [sharedProvider reportCallWithUUID:uuid endedAtDate:[NSDate date] reason:CXCallEndedReasonAnsweredElsewhere];
+-            break;
+-        case 5:
+-            [sharedProvider reportCallWithUUID:uuid endedAtDate:[NSDate date] reason:CXCallEndedReasonDeclinedElsewhere];
+-            break;
+-        default:
+-            break;
++    if (uuid == nil) {
++        return;
++    }
++    RNCallKeep *inst = [RNCallKeep allocWithZone:nil];
++    [inst voxoApplyStoredRecentsSnapshotBeforeEndForUuid:uuid];
++
++    void (^endBlock)(void) = ^{
++        if (sharedProvider == nil) {
++            NSLog(@"[RNCallKeep][reportEndCallWithUUID] sharedProvider nil — abort");
++            return;
++        }
++        switch (reason) {
++            case 1:
++                [sharedProvider reportCallWithUUID:uuid endedAtDate:[NSDate date] reason:CXCallEndedReasonFailed];
++                break;
++            case 2:
++            case 6:
++                [sharedProvider reportCallWithUUID:uuid endedAtDate:[NSDate date] reason:CXCallEndedReasonRemoteEnded];
++                break;
++            case 3:
++                [sharedProvider reportCallWithUUID:uuid endedAtDate:[NSDate date] reason:CXCallEndedReasonUnanswered];
++                break;
++            case 4:
++                [sharedProvider reportCallWithUUID:uuid endedAtDate:[NSDate date] reason:CXCallEndedReasonAnsweredElsewhere];
++                break;
++            case 5:
++                [sharedProvider reportCallWithUUID:uuid endedAtDate:[NSDate date] reason:CXCallEndedReasonDeclinedElsewhere];
++                break;
++            default:
++                break;
++        }
++    };
++    if ([NSThread isMainThread]) {
++        endBlock();
++    } else {
++        dispatch_sync(dispatch_get_main_queue(), endBlock);
+     }
+ }
+ 
+@@ -967,18 +1542,83 @@ + (BOOL)application:(UIApplication *)application
+     return YES;
+ }
+ 
++- (void)voxoStoreRecentsIntentPayloadForUuid:(NSUUID *)uuid
++                                 displayName:(NSString *)dn
++                                  dialHandle:(NSString *)dial
++{
++    if (uuid == nil) {
++        return;
++    }
++    NSString *k = uuid.UUIDString.uppercaseString;
++    @synchronized (self) {
++        if (_voxoRecentsIntentPayloadByUuid == nil) {
++            _voxoRecentsIntentPayloadByUuid = [NSMutableDictionary dictionary];
++        }
++        _voxoRecentsIntentPayloadByUuid[k] = @{
++            @"displayName": dn ?: @"",
++            @"dialHandle": dial ?: @""
++        };
++    }
++    NSLog(@"[VOXO_RECENTS_CK] intentPayload STORED uuid=%@ nameLen=%lu dialLen=%lu",
++          k,
++          (unsigned long)voxoRKTrim(dn).length,
++          (unsigned long)voxoRKTrim(dial).length);
++}
++
++- (NSDictionary *)voxoTakeRecentsIntentPayloadForUuid:(NSUUID *)uuid
++{
++    if (uuid == nil) {
++        return nil;
++    }
++    NSString *k = uuid.UUIDString.uppercaseString;
++    NSDictionary *out = nil;
++    @synchronized (self) {
++        NSDictionary *o = _voxoRecentsIntentPayloadByUuid[k];
++        if (o != nil) {
++            [_voxoRecentsIntentPayloadByUuid removeObjectForKey:k];
++            NSLog(@"[VOXO_RECENTS_CK] intentPayload TAKE uuid=%@ nameLen=%lu dialLen=%lu",
++                  k,
++                  (unsigned long)voxoRKTrim([o objectForKey:@"displayName"]).length,
++                  (unsigned long)voxoRKTrim([o objectForKey:@"dialHandle"]).length);
++        } else {
++            NSLog(@"[VOXO_RECENTS_CK] intentPayload TAKE uuid=%@ none (no stashed INPerson payload)", k);
++        }
++        out = o;
++    }
++    return out;
++}
++
+ + (BOOL)application:(UIApplication *)application
+ continueUserActivity:(NSUserActivity *)userActivity
+  restorationHandler:(void(^)(NSArray * __nullable restorableObjects))restorationHandler
+ {
+-#ifdef DEBUG
+-    NSLog(@"[RNCallKeep][application:continueUserActivity]");
+-#endif
++    NSString *appStateStr = (application.applicationState == UIApplicationStateActive) ? @"ACTIVE" :
++        (application.applicationState == UIApplicationStateBackground) ? @"BACKGROUND" : @"INACTIVE";
++    NSLog(@"[VOXO_CK] continueUserActivity ENTRY activityType=%@ appState=%@ main=%d",
++          userActivity.activityType ?: @"(nil)",
++          appStateStr,
++          [NSThread isMainThread]);
++
+     INInteraction *interaction = userActivity.interaction;
+-    INPerson *contact;
++    INPerson *contact = nil;
+     NSString *handle;
+-    BOOL isAudioCall;
+-    BOOL isVideoCall;
++    BOOL isAudioCall = NO;
++    BOOL isVideoCall = NO;
++
++    if (interaction == nil) {
++        NSString *t = voxoRKTrim(userActivity.title);
++        if (voxoRKTitleLooksDialable(t)) {
++            handle = [t stringByReplacingOccurrencesOfString:@" " withString:@""];
++            isAudioCall = YES;
++            isVideoCall = NO;
++            NSLog(@"[VOXO_RECENTS_CK] continueUserActivity interaction=nil using dialable userActivity.title len=%lu",
++                  (unsigned long)handle.length);
++            goto voxo_recents_emit_start;
++        }
++        NSLog(@"[VOXO_CK] continueUserActivity FAIL interaction=nil (no SiriKit payload — cannot resolve handle)");
++        NSLog(@"[VOXO_RECENTS_CK] continueUserActivity NO interaction — filter VOXO_CK / open app from Recents will not run");
++        return NO;
++    }
+ 
+     // HACK TO AVOID XCODE 10 COMPILE CRASH
+     // REMOVE ON NEXT MAJOR RELEASE OF RNCALLKIT
+@@ -1006,6 +1646,11 @@ + (BOOL)application:(UIApplication *)application
+     }
+ #endif
+ 
++    NSLog(@"[VOXO_CK] continueUserActivity intentClass=%@ isAudio=%d isVideo=%d",
++          interaction.intent ? NSStringFromClass([interaction.intent class]) : @"(nil)",
++          isAudioCall,
++          isVideoCall);
++
+     if (isAudioCall) {
+         INStartAudioCallIntent *startAudioCallIntent = (INStartAudioCallIntent *)interaction.intent;
+         contact = [startAudioCallIntent.contacts firstObject];
+@@ -1014,20 +1659,109 @@ + (BOOL)application:(UIApplication *)application
+         contact = [startVideoCallIntent.contacts firstObject];
+     }
+ 
++    // Phone → Recents often delivers INStartCallIntent with unknown capability: neither audio nor video,
++    // so the branches above never run and contact stayed nil. Always fall back to INStartCallIntent.contacts.
++    if (contact == nil && [interaction.intent isKindOfClass:[INStartCallIntent class]]) {
++        INStartCallIntent *startCallIntent = (INStartCallIntent *)interaction.intent;
++        NSArray *contacts = startCallIntent.contacts;
++        contact = contacts.firstObject;
++        NSLog(@"[VOXO_CK] continueUserActivity generic INStartCallIntent fallback contacts.count=%lu",
++              (unsigned long)contacts.count);
++    }
++
+     if (contact != nil) {
+-        handle = contact.personHandle.value;
++        handle = VoxoRKDialableHandleFromINPerson(contact);
++        if (handle.length == 0) {
++            handle = contact.personHandle.value;
++        }
++    }
++
++    if (handle == nil || handle.length == 0) {
++        NSString *recovered = VoxoRKDialableHandleFromStartCallIntent(interaction.intent);
++        if (recovered.length > 0) {
++            handle = recovered;
++            NSLog(@"[VOXO_RECENTS_CK] continueUserActivity recovered handle via INPerson.phoneNumbers / full contact scan len=%lu",
++                  (unsigned long)handle.length);
++        }
+     }
+ 
++voxo_recents_emit_start:
+     if (handle != nil && handle.length > 0 ){
++        RNCallKeep *callKeep = [RNCallKeep allocWithZone: nil];
++        NSString *intentDisplayName = VoxoRKDisplayNameFromINPerson(contact);
++
++        if (contact != nil) {
++            NSString *phv = contact.personHandle.value;
++            NSLog(@"[VOXO_RECENTS_CK] continueUserActivity INPerson scan displayNameLen=%lu personHandle.type=%ld personHandle.valueLen=%lu valuePrefix=%.40s",
++                  (unsigned long)intentDisplayName.length,
++                  (long)contact.personHandle.type,
++                  (unsigned long)(phv ? phv.length : 0),
++                  (phv != nil && phv.UTF8String != NULL) ? phv.UTF8String : "");
++        } else {
++            NSLog(@"[VOXO_RECENTS_CK] continueUserActivity no INPerson (intentDisplayName unavailable; title-only path)");
++        }
++        NSLog(@"[VOXO_RECENTS_CK] continueUserActivity resolved dialHandleLen=%lu dialPrefix=%.40s",
++              (unsigned long)handle.length,
++              (handle.UTF8String != NULL) ? handle.UTF8String : "");
++
++        CXHandleType cxHandleType = VoxoCallKeepHandleTypeForUpdateDisplayUri(handle);
++        NSLog(@"[VOXO_RECENTS_CK] continueUserActivity CXHandleType=%ld (expect Phone=%ld for E.164/short ext)",
++              (long)cxHandleType,
++              (long)CXHandleTypePhoneNumber);
++
++        NSLog(@"[VOXO_RECENTS_CK] continueUserActivity merged intentDisplayNamePrefix=%.60s",
++              intentDisplayName.length ? intentDisplayName.UTF8String : "");
++
++        // Recents / Siri often deliver INStartCallIntent here without performStartCallAction.
++        // Stock RNCallKeep only sent { handle, video } — JS saw empty callUUID and invented a
++        // random UUID, so CallKit state (status bar / Dynamic Island) never matched SIP reports.
++        if (callKeep.callKeepProvider != nil) {
++            NSUUID *uuid = [NSUUID UUID];
++            [callKeep->_systemInitiatedCallUUIDs addObject:uuid.UUIDString.uppercaseString];
++            NSLog(@"[VOXO_CK] continueUserActivity: marked %@ as system-initiated (Recents/Siri)", uuid.UUIDString);
++
++            CXHandle *callHandle = [[CXHandle alloc] initWithType:cxHandleType value:handle];
++            CXStartCallAction *startCallAction = [[CXStartCallAction alloc] initWithCallUUID:uuid handle:callHandle];
++            [startCallAction setVideo:isVideoCall];
++            if (intentDisplayName.length > 0) {
++                [startCallAction setContactIdentifier:intentDisplayName];
++                NSLog(@"[VOXO_RECENTS_CK] continueUserActivity setContactIdentifier len=%lu",
++                      (unsigned long)intentDisplayName.length);
++            }
++            CXTransaction *transaction = [[CXTransaction alloc] initWithAction:startCallAction];
++            [callKeep voxoStoreRecentsIntentPayloadForUuid:uuid displayName:intentDisplayName dialHandle:handle];
++            [callKeep requestTransaction:transaction];
++            NSLog(@"[VOXO_CK] continueUserActivity → CXStartCall uuid=%@ handle=%@", uuid.UUIDString, handle);
++            VoxoStashPendingRecentsFromPhoneApp(handle, uuid.UUIDString, intentDisplayName);
++            return YES;
++        }
++
++        NSString *fallbackUuid = [[[NSUUID UUID] UUIDString] lowercaseString];
+         NSDictionary *userInfo = @{
+             @"handle": handle,
+-            @"video": @(isVideoCall)
++            @"video": @(isVideoCall),
++            @"callUUID": fallbackUuid,
++            @"name": intentDisplayName ?: @""
+         };
+-
+-        RNCallKeep *callKeep = [RNCallKeep allocWithZone: nil];
++        NSLog(@"[VOXO_CK] continueUserActivity fallback (CallKit not configured yet) uuid=%@", fallbackUuid);
++        NSUUID *fallbackNsUuid = [[NSUUID alloc] initWithUUIDString:fallbackUuid];
++        if (fallbackNsUuid != nil) {
++            [callKeep->_systemInitiatedCallUUIDs addObject:fallbackNsUuid.UUIDString.uppercaseString];
++            NSLog(@"[VOXO_CK] continueUserActivity: marked %@ as system-initiated (fallback)", fallbackNsUuid.UUIDString);
++        }
++        [callKeep voxoStoreRecentsIntentPayloadForUuid:fallbackNsUuid displayName:intentDisplayName dialHandle:handle];
++        VoxoStashPendingRecentsFromPhoneApp(handle, fallbackUuid, intentDisplayName);
+         [callKeep sendEventWithNameWrapper:RNCallKeepDidReceiveStartCallAction body:userInfo];
+         return YES;
+     }
++
++    NSLog(@"[VOXO_CK] continueUserActivity ABANDON emptyHandle activityType=%@ intentClass=%@ appState=%@ "
++          @"personHandle=%@ (Phone Recents row may use an intent type we did not parse)",
++          userActivity.activityType ?: @"(nil)",
++          interaction && interaction.intent ? NSStringFromClass([interaction.intent class]) : @"(nil)",
++          appStateStr,
++          contact ? (contact.personHandle.value ?: @"(nil value)") : @"(no contact)");
++    NSLog(@"[VOXO_RECENTS_CK] continueUserActivity ABANDON — tap from Phone Recents did not yield a dialable handle; see personHandle line above. Return NO → AppDelegate may log UNHANDLED.");
+     return NO;
+ }
+ 
+@@ -1053,25 +1787,84 @@ - (void)provider:(CXProvider *)provider performStartCallAction:(CXStartCallActio
+ #ifdef DEBUG
+     NSLog(@"[RNCallKeep][CXProviderDelegate][provider:performStartCallAction]");
+ #endif
+-    //do this first, audio sessions are flakey
++    NSLog(@"[VOXO_CK] performStartCallAction uuid=%@ handle=%@", action.callUUID.UUIDString, action.handle.value);
++    NSLog(@"[VOXO_RECENTS_CK] performStartCallAction handleValue=%@ handleType=%ld contactIdentifierLen=%lu",
++          action.handle.value ?: @"(nil)",
++          (long)action.handle.type,
++          (unsigned long)voxoRKTrim(action.contactIdentifier).length);
++    VoxoCKLogCalls(@"performStartCallAction(before fulfill)", action.callUUID.UUIDString);
++
++    NSDictionary *recentsPayload = [self voxoTakeRecentsIntentPayloadForUuid:action.callUUID];
++    NSString *payloadName = @"";
++    NSString *payloadDial = @"";
++    if (recentsPayload != nil) {
++        payloadName = voxoRKTrim([recentsPayload objectForKey:@"displayName"]);
++        payloadDial = voxoRKTrim([recentsPayload objectForKey:@"dialHandle"]);
++    }
++    NSString *resolvedName = payloadName.length > 0 ? payloadName : voxoRKTrim(action.contactIdentifier);
++    NSString *handleStr = voxoRKTrim(action.handle.value);
++    NSString *resolvedDial = payloadDial.length > 0 ? payloadDial : handleStr;
++
++    NSLog(@"[VOXO_RECENTS_CK] performStartCallAction merged → JS nameLen=%lu handleLen=%lu (payloadDialLen=%lu)",
++          (unsigned long)resolvedName.length,
++          (unsigned long)handleStr.length,
++          (unsigned long)payloadDial.length);
++
+     [self configureAudioSession];
+     //tell the JS to actually make the call
+-    [self sendEventWithNameWrapper:RNCallKeepDidReceiveStartCallAction body:@{ @"callUUID": [action.callUUID.UUIDString lowercaseString], @"handle": action.handle.value }];
++    [self sendEventWithNameWrapper:RNCallKeepDidReceiveStartCallAction body:@{
++        @"callUUID": [action.callUUID.UUIDString lowercaseString],
++        @"handle": action.handle.value ?: @"",
++        @"name": resolvedName,
++        @"video": @(action.video)
++    }];
+     [action fulfill];
++    NSLog(@"[VOXO_CK] performStartCallAction fulfill DONE uuid=%@", action.callUUID.UUIDString);
++    VoxoCKLogCalls(@"performStartCallAction(after fulfill)", action.callUUID.UUIDString);
++
++    // Mirror transaction completion CXCallUpdate (moved here so it runs after fulfill, not before).
++    CXCallUpdate *callUpdate = [[CXCallUpdate alloc] init];
++    CXHandleType bestType = VoxoCallKeepHandleTypeForUpdateDisplayUri(resolvedDial);
++    if (bestType == CXHandleTypePhoneNumber && resolvedDial.length > 0) {
++        callUpdate.remoteHandle = [[CXHandle alloc] initWithType:CXHandleTypePhoneNumber value:resolvedDial];
++        NSLog(@"[VOXO_RECENTS_CK] performStartCallAction post-fulfill CXCallUpdate remoteHandle Phone len=%lu",
++              (unsigned long)resolvedDial.length);
++    } else {
++        callUpdate.remoteHandle = action.handle;
++        NSLog(@"[VOXO_RECENTS_CK] performStartCallAction post-fulfill CXCallUpdate remoteHandle from action type=%ld",
++              (long)action.handle.type);
++    }
++    callUpdate.hasVideo = action.video;
++    if (resolvedName.length > 0) {
++        callUpdate.localizedCallerName = resolvedName;
++        NSLog(@"[VOXO_RECENTS_CK] performStartCallAction post-fulfill localizedCallerName len=%lu",
++              (unsigned long)resolvedName.length);
++    }
++    callUpdate.supportsDTMF = YES;
++    callUpdate.supportsHolding = NO;
++    callUpdate.supportsGrouping = NO;
++    callUpdate.supportsUngrouping = NO;
++    [self.callKeepProvider reportCallWithUUID:action.callUUID updated:callUpdate];
++    NSLog(@"[VOXO_CK] reportCallWithUUID(updated) after performStartCall fulfill uuid=%@", action.callUUID.UUIDString);
++    VoxoCKLogCalls(@"after StartCall reportCall updated", action.callUUID.UUIDString);
+ }
+ 
+-// Update call contact info
+-// @deprecated
+ RCT_EXPORT_METHOD(reportUpdatedCall:(NSString *)uuidString contactIdentifier:(NSString *)contactIdentifier)
+ {
+-#ifdef DEBUG
+-    NSLog(@"[RNCallKeep][reportUpdatedCall] contactIdentifier = %i", contactIdentifier);
+-#endif
++    NSLog(@"[VOXO_RECENTS_CK] reportUpdatedCall ENTRY uuid=%@ name=%@",
++          uuidString ?: @"(nil)", contactIdentifier ?: @"(nil)");
+     NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:uuidString];
++    if (uuid == nil) {
++        NSLog(@"[VOXO_RECENTS_CK] reportUpdatedCall ABORT invalid uuidString");
++        return;
++    }
+     CXCallUpdate *callUpdate = [[CXCallUpdate alloc] init];
+     callUpdate.localizedCallerName = contactIdentifier;
+ 
+-    [self.callKeepProvider reportCallWithUUID:uuid updated:callUpdate];
++    dispatch_async(dispatch_get_main_queue(), ^{
++        [self.callKeepProvider reportCallWithUUID:uuid updated:callUpdate];
++        NSLog(@"[VOXO_RECENTS_CK] reportUpdatedCall DONE uuid=%@", uuidString);
++    });
+ }
+ 
+ // Answering incoming call
+@@ -1091,8 +1884,12 @@ - (void)provider:(CXProvider *)provider performEndCallAction:(CXEndCallAction *)
+ #ifdef DEBUG
+     NSLog(@"[RNCallKeep][CXProviderDelegate][provider:performEndCallAction]");
+ #endif
++    NSLog(@"[VOXO_CK] performEndCallAction uuid=%@", action.callUUID.UUIDString);
++    VoxoCKLogCalls(@"performEndCallAction(before fulfill)", action.callUUID.UUIDString);
+     [self sendEventWithNameWrapper:RNCallKeepPerformEndCallAction body:@{ @"callUUID": [action.callUUID.UUIDString lowercaseString] }];
+     [action fulfill];
++    NSLog(@"[VOXO_CK] performEndCallAction fulfill DONE uuid=%@", action.callUUID.UUIDString);
++    [self voxoScheduleRecycleAfterCallEnded];
+ }
+ 
+ -(void)provider:(CXProvider *)provider performSetHeldCallAction:(CXSetHeldCallAction *)action

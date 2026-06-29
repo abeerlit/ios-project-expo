@@ -1,19 +1,20 @@
 {
   "expo": {
+    "owner": "voxo",
     "name": "ios-project-expo",
-    "slug": "ios-project-expo",
+    "slug": "voxo-connect-ios-expo",
     "version": "1.0.0",
-    "orientation": "portrait",
-    "icon": "./assets/icon.png",
+    "orientation": "default",
+    "icon": "./branding/voxo/icon.png",
     "userInterfaceStyle": "light",
-    "newArchEnabled": true,
+    "newArchEnabled": false,
     "splash": {
-      "image": "./assets/splash-icon.png",
+      "image": "./branding/voxo/splash.png",
       "resizeMode": "contain",
       "backgroundColor": "#ffffff"
     },
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": false
     },
     "android": {
       "adaptiveIcon": {
@@ -25,6 +26,18 @@
     },
     "web": {
       "favicon": "./assets/favicon.png"
+    },
+    "extra": {
+      "EXPO_PUBLIC_NATIVE_TELEPHONY": false,
+      "EXPO_PUBLIC_NATIVE_NOTIFICATIONS": false,
+      "EXPO_PUBLIC_CHAT_NATIVE": true,
+      "EXPO_PUBLIC_MEETINGS_NATIVE": false,
+      "EXPO_PUBLIC_MINIMAL_BOOT": false,
+      "APP_ICON": "/Users/app/Desktop/voxo/ios-project-expo/branding/voxo/icon.png",
+      "SPLASH_IMAGE": "/Users/app/Desktop/voxo/ios-project-expo/branding/voxo/splash.png",
+      "eas": {
+        "projectId": "5461d0f9-2765-45dc-9f15-db4e1943c159"
+      }
     }
   }
 }

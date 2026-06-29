@@ -1,0 +1,5 @@
+# DOOK-1279 smoke (run on staging build with test credentials)
+appId: co.voxo.voxo-ios
+---
+- launchApp
+- assertVisible: "Sign in"

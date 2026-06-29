@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta
+    content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"
+    name="viewport"
+  />
+  <title>RichTextEditor</title>
+  <style>
+      body {
+          font-family: Inter, sans-serif;
+          background: {{theme-background}};
+          color: {{theme-color}};
+      }
+  </style>
+</head>
+<style>
+    body {
+        margin: 0;
+        padding: 0;
+    }
+
+    #root > div:nth-of-type(1) {
+        height: 100%;
+        position: absolute;
+        width: 100%;
+        top: 0;
+        bottom: 0;
+    }
+
+    #root div .ProseMirror {
+        height: 100%;
+        overflow: auto;
+    }
+
+    .ProseMirror:focus {
+        outline: none;
+    }
+</style>
+<body>
+<div id="root"></div>
+<script src="./index.tsx" type="module"></script>
+</body>
+</html>
