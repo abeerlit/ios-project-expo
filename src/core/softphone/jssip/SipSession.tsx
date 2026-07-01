@@ -388,6 +388,24 @@ class SipSession extends events.EventEmitter {
     this.renegAllowed = true;
   }
 
+  setRemoteAudioEnabled(enabled: boolean): void {
+    try {
+      const pc = this.rtcSession?._connection;
+      if (!pc?.getReceivers) {
+        return;
+      }
+      for (const receiver of pc.getReceivers()) {
+        const track = receiver?.track;
+        if (track && track.kind === "audio") {
+          track.enabled = enabled;
+        }
+      }
+      console.warn("[RINGBACK-TRACE] setRemoteAudioEnabled", { callUuid: this.callUuid, enabled });
+    } catch (e) {
+      console.warn("[RINGBACK-TRACE] setRemoteAudioEnabled failed:", e);
+    }
+  }
+
   private onPeerConnection(pc: RTCPeerConnection) {
     logger.debug("Reached On Peer Connection");
     pc.addEventListener("addstream", () => {

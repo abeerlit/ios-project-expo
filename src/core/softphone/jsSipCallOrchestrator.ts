@@ -101,6 +101,7 @@ export function wireOutboundSipSessionListeners(
   let navigatedConnected = false;
 
   const onConnected = () => {
+    sipSession.setRemoteAudioEnabled(true);
     applyCallStateChange(callUuid, CallState.CONNECTED);
     updateCall(callUuid, { connected: true });
     void nativeIntegration.updateCallState(callUuid, CallState.CONNECTED);
@@ -125,10 +126,17 @@ export function wireOutboundSipSessionListeners(
   sipSession.on("remoteRinging", () => {
     applyCallStateChange(callUuid, CallState.OUTGOING);
     updateCall(callUuid, { state: CallState.OUTGOING });
+    nativeIntegration.ensureOutboundRingbackPlaying?.();
   });
 
   sipSession.on("remoteProgress", () => {
     applyCallStateChange(callUuid, CallState.OUTGOING);
+  });
+
+  sipSession.on("remoteSessionProgress", () => {
+    applyCallStateChange(callUuid, CallState.OUTGOING);
+    sipSession.setRemoteAudioEnabled(false);
+    nativeIntegration.ensureOutboundRingbackPlaying?.();
   });
 
   sipSession.on("accepted", onConnected);

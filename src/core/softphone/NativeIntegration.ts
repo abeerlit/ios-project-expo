@@ -375,6 +375,26 @@ export class NativeIntegration {
     });
   }
 
+  public ensureOutboundRingbackPlaying(): void {
+    if (Platform.OS !== "ios") return;
+    try {
+      InCallManager.stopRingback();
+      InCallManager.start({ media: "audio", auto: true });
+      setTimeout(() => {
+        try {
+          InCallManager.startRingback("_BUNDLE_");
+        } catch (e) {
+          console.warn(
+            "[NI-RINGBACK] ensureOutboundRingbackPlaying startRingback failed:",
+            e
+          );
+        }
+      }, 220);
+    } catch (e) {
+      console.warn("[NI-RINGBACK] ensureOutboundRingbackPlaying failed:", e);
+    }
+  }
+
   /**
    * iOS: play bundled "brrr brrr" ringback (incallmanager_ringback.mp3) for outgoing calls.
    */

@@ -2,6 +2,8 @@
   "extends": "expo/tsconfig.base",
   "compilerOptions": {
     "strict": false,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
     "baseUrl": ".",
     "paths": {
       "@api/*": ["src/api/*"],
@@ -15,7 +17,8 @@
       "@router/*": ["src/router/*"],
       "@store/*": ["src/store/*"],
       "@types/*": ["src/types/*"],
-      "@views/*": ["src/views/*"]
+      "@views/*": ["src/views/*"],
+      "*": ["src/*"]
     }
   },
   "include": ["**/*.ts", "**/*.tsx", "expo-shell/**/*.ts", "expo-shell/**/*.tsx"],
