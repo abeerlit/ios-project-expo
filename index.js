@@ -26,6 +26,7 @@ if (telephonyOn || meetingsOn) {
 // Bare ios-project/index.js: CallKit bootstrap + native VoIP flags before first PushKit.
 if (telephonyOn && Platform.OS === "ios") {
   try {
+    require("./src/core/softphone/iosOutboundStartupGuard.ts").markIosJsBundleLoaded();
     require("./expo-shell/iosNativeCallModule.ts").syncIosNativeCallFlags();
     require("./expo-shell/iosCallKitEntryBootstrap.ts").runIosCallKitEntryBootstrap();
   } catch (e) {

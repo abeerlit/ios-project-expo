@@ -58,6 +58,10 @@ import InCallManager from "react-native-incall-manager";
 import { isAnsweredElsewhereSessionFailed } from "./utils/session-failed-reason";
 import { showCallPickedElsewhereNotification } from "../notifications/callPickedElsewhereNotification";
 import { iosCallFlowError, iosCallFlowLog } from "./iosCallFlowLog.ts";
+import {
+  getOutboundStartupGraceRemainingMs,
+  isOutboundStartupGraceActive
+} from "./iosOutboundStartupGuard.ts";
 import { playDtmfSidetoneIos } from "./dtmfSidetoneIos.ts";
 import {
   setSipBackendCallIdHandler,
@@ -2123,6 +2127,18 @@ export const SoftphoneProvider: React.FC<{ children: React.ReactNode }> = ({
               const safeUUID = String(callUUID || "").trim().toLowerCase();
               const safeName = String(name || "").trim();
               if (!safeHandle || !safeUUID) return;
+
+              if (isOutboundStartupGraceActive()) {
+                iosCallFlowLog(
+                  "outbound.callkit",
+                  "start handler ignored — startup grace",
+                  {
+                    callUUID: safeUUID,
+                    remainingMs: getOutboundStartupGraceRemainingMs()
+                  }
+                );
+                return;
+              }
 
               const displayForCallKit = resolveCallKitStartDisplayName(
                 safeName,

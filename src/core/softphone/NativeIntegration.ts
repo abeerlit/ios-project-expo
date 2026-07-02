@@ -13,6 +13,12 @@ import {
   pullNativePendingRecentsIntent,
   type PendingRecentsStart
 } from "./iosRecentsEarly.ts";
+import {
+  dedupePendingRecentsStarts,
+  getOutboundStartupGraceRemainingMs,
+  isOutboundStartupGraceActive,
+  normalizeOutboundRecentsHandle
+} from "./iosOutboundStartupGuard.ts";
 
 const logger = new Logger("NativeIntegration: ");
 
@@ -227,6 +233,7 @@ export class NativeIntegration {
   private startCallHandlerAttached = false;
   /** Recents starts received before attachStartCallHandler (killed-process race). */
   private pendingRecentsStarts: PendingRecentsStart[] = [];
+  private pendingRecentsFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
   /**
    * While set, ignore `didPerformSetMutedCallAction` (programmatic `CallKeep.setMutedCall`
@@ -1099,8 +1106,35 @@ export class NativeIntegration {
     if (!this.startCallHandlerAttached || this.pendingRecentsStarts.length === 0) {
       return;
     }
-    const batch = [...this.pendingRecentsStarts];
+
+    const graceRemainingMs = getOutboundStartupGraceRemainingMs();
+    if (graceRemainingMs > 0) {
+      if (this.pendingRecentsFlushTimer != null) {
+        return;
+      }
+      iosCallFlowLog("outbound", "defer recents flush — startup grace", {
+        remainingMs: graceRemainingMs,
+        queued: this.pendingRecentsStarts.length
+      });
+      this.pendingRecentsFlushTimer = setTimeout(() => {
+        this.pendingRecentsFlushTimer = null;
+        void this.flushPendingRecentsStartsAsync();
+      }, graceRemainingMs);
+      return;
+    }
+
+    const rawBatch = [...this.pendingRecentsStarts];
+    const batch = dedupePendingRecentsStarts(rawBatch);
     this.pendingRecentsStarts = [];
+    if (batch.length < rawBatch.length) {
+      iosCallFlowLog("outbound", "deduped pending Recents flush", {
+        before: rawBatch.length,
+        after: batch.length
+      });
+      console.warn(
+        `${RECENTS_TRACE} flushPendingRecents deduped ${rawBatch.length} → ${batch.length}`
+      );
+    }
     for (const item of batch) {
       try {
         await Promise.resolve(this.onStartCall(item));
@@ -1114,6 +1148,12 @@ export class NativeIntegration {
   }
 
   private enqueuePendingRecentsStart(item: PendingRecentsStart): void {
+    const handleKey = normalizeOutboundRecentsHandle(item.handle);
+    if (handleKey) {
+      this.pendingRecentsStarts = this.pendingRecentsStarts.filter(
+        (x) => normalizeOutboundRecentsHandle(x.handle) !== handleKey
+      );
+    }
     this.pendingRecentsStarts = this.pendingRecentsStarts.filter(
       (x) => x.callUUID !== item.callUUID
     );
@@ -1519,6 +1559,25 @@ export class NativeIntegration {
             appState: this.appState
           }
         );
+
+        if (Platform.OS === "ios" && isOutboundStartupGraceActive()) {
+          const deferUuid = rawUUID || uuid();
+          this.enqueuePendingRecentsStart({
+            callUUID: deferUuid,
+            handle: String(handle || ""),
+            ...(contactName ? { name: contactName } : {})
+          });
+          iosCallFlowLog("outbound", "didReceiveStartCallAction deferred (startup grace)", {
+            callUUID: deferUuid,
+            remainingMs: getOutboundStartupGraceRemainingMs()
+          });
+          console.warn(
+            `${RECENTS_TRACE} didReceiveStartCallAction DEFER startup_grace uuid=${deferUuid} remainingMs=${getOutboundStartupGraceRemainingMs()}`
+          );
+          this.flushPendingRecentsStarts();
+          return;
+        }
+
         // If this UUID is already mapped to a real SIP session, ignore. Do NOT treat the
         // temporary uuid→uuid placeholder (Recents) as "handled" — a second native
         // callback would otherwise skip SIP entirely.
