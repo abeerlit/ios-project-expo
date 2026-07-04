@@ -17,7 +17,10 @@ import {
   dedupePendingRecentsStarts,
   getOutboundStartupGraceRemainingMs,
   isOutboundStartupGraceActive,
-  normalizeOutboundRecentsHandle
+  markIosAppForegrounded,
+  markOutboundCallKitCompleted,
+  normalizeOutboundRecentsHandle,
+  shouldBlockStaleOutboundStartAction
 } from "./iosOutboundStartupGuard.ts";
 
 const logger = new Logger("NativeIntegration: ");
@@ -850,6 +853,19 @@ export class NativeIntegration {
             callId,
             callUUID
           );
+          if (
+            Platform.OS === "ios" &&
+            (this.outboundCallKitUuids.has(callUUID.toLowerCase()) ||
+              this.startedOutgoingCallUuids.has(callUUID.toLowerCase()))
+          ) {
+            const snap = this.iosCallKitRecentsEndSnapshotByUuidLower.get(
+              callUUID.toLowerCase()
+            );
+            markOutboundCallKitCompleted(
+              callUUID,
+              snap?.dialHint || snap?.displayName
+            );
+          }
           if (suppressCallKeepEnd) {
             console.warn(
               "[MERGE-AUDIO] NI.updateCallState skip CallKeep end — UUID kept for merge survivor",
@@ -1124,7 +1140,23 @@ export class NativeIntegration {
     }
 
     const rawBatch = [...this.pendingRecentsStarts];
-    const batch = dedupePendingRecentsStarts(rawBatch);
+    const batch = dedupePendingRecentsStarts(rawBatch).filter((item) => {
+      const block = shouldBlockStaleOutboundStartAction({
+        callUUID: item.callUUID,
+        handle: item.handle,
+        hasLiveSipSession: !!getSipSession(item.callUUID),
+        queuedAt: item.queuedAt
+      });
+      if (block.blocked) {
+        iosCallFlowLog("outbound", "drop stale pending Recents start", {
+          callUUID: item.callUUID,
+          handle: item.handle,
+          reason: block.reason
+        });
+        return false;
+      }
+      return true;
+    });
     this.pendingRecentsStarts = [];
     if (batch.length < rawBatch.length) {
       iosCallFlowLog("outbound", "deduped pending Recents flush", {
@@ -1148,16 +1180,20 @@ export class NativeIntegration {
   }
 
   private enqueuePendingRecentsStart(item: PendingRecentsStart): void {
-    const handleKey = normalizeOutboundRecentsHandle(item.handle);
+    const queuedItem: PendingRecentsStart = {
+      ...item,
+      queuedAt: item.queuedAt ?? Date.now()
+    };
+    const handleKey = normalizeOutboundRecentsHandle(queuedItem.handle);
     if (handleKey) {
       this.pendingRecentsStarts = this.pendingRecentsStarts.filter(
         (x) => normalizeOutboundRecentsHandle(x.handle) !== handleKey
       );
     }
     this.pendingRecentsStarts = this.pendingRecentsStarts.filter(
-      (x) => x.callUUID !== item.callUUID
+      (x) => x.callUUID !== queuedItem.callUUID
     );
-    this.pendingRecentsStarts.push(item);
+    this.pendingRecentsStarts.push(queuedItem);
     while (this.pendingRecentsStarts.length > PENDING_RECENTS_MAX) {
       this.pendingRecentsStarts.shift();
     }
@@ -1196,6 +1232,7 @@ export class NativeIntegration {
    * Handle app resuming from background
    */
   private handleAppResume(): void {
+    markIosAppForegrounded();
     // Check if there are any active calls that need to be restored
     if (this.activeCalls.size > 0) {
       logger.debug(
@@ -1209,6 +1246,11 @@ export class NativeIntegration {
    * Handle app going to background
    */
   private handleAppBackground(): void {
+    if (this.pendingRecentsFlushTimer != null) {
+      clearTimeout(this.pendingRecentsFlushTimer);
+      this.pendingRecentsFlushTimer = null;
+    }
+    this.pendingRecentsStarts = [];
     if (this.activeCalls.size > 0) {
       logger.debug(
         `Maintaining ${this.activeCalls.size} active calls in background`
@@ -1578,6 +1620,33 @@ export class NativeIntegration {
           return;
         }
 
+        const lastAppInitiatedAtEarly = rawUUID
+          ? this.startedOutgoingCallUuids.get(rawUUID)
+          : undefined;
+        const staleOutbound = shouldBlockStaleOutboundStartAction({
+          callUUID: rawUUID,
+          handle: String(handle || ""),
+          hasLiveSipSession: rawUUID ? !!getSipSession(rawUUID) : false,
+          isAppInitiatedRecently:
+            !!lastAppInitiatedAtEarly &&
+            now - lastAppInitiatedAtEarly < 15000
+        });
+        if (Platform.OS === "ios" && staleOutbound.blocked) {
+          iosCallFlowLog(
+            "outbound",
+            "didReceiveStartCallAction ignored (stale replay)",
+            {
+              callUUID: rawUUID,
+              handle: String(handle || ""),
+              reason: staleOutbound.reason
+            }
+          );
+          console.warn(
+            `${RECENTS_TRACE} didReceiveStartCallAction SKIP stale_replay uuid=${rawUUID} reason=${staleOutbound.reason}`
+          );
+          return;
+        }
+
         // If this UUID is already mapped to a real SIP session, ignore. Do NOT treat the
         // temporary uuid→uuid placeholder (Recents) as "handled" — a second native
         // callback would otherwise skip SIP entirely.
@@ -1880,6 +1949,17 @@ export class NativeIntegration {
       const sipOrPlaceholderId = this.activeCalls.get(k);
       if (sipOrPlaceholderId != null) {
         this.activeSipCallIds.delete(sipOrPlaceholderId);
+      }
+      const keyLower = k.toLowerCase();
+      if (
+        this.outboundCallKitUuids.has(keyLower) ||
+        this.startedOutgoingCallUuids.has(keyLower)
+      ) {
+        const snap = this.iosCallKitRecentsEndSnapshotByUuidLower.get(keyLower);
+        markOutboundCallKitCompleted(
+          keyLower,
+          snap?.dialHint || snap?.displayName
+        );
       }
       this.activeCalls.delete(k);
       this.startedOutgoingCallUuids.delete(k.toLowerCase());

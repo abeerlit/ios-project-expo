@@ -60,7 +60,9 @@ import { showCallPickedElsewhereNotification } from "../notifications/callPicked
 import { iosCallFlowError, iosCallFlowLog } from "./iosCallFlowLog.ts";
 import {
   getOutboundStartupGraceRemainingMs,
-  isOutboundStartupGraceActive
+  isOutboundStartupGraceActive,
+  markIosAppForegrounded,
+  shouldBlockStaleOutboundStartAction
 } from "./iosOutboundStartupGuard.ts";
 import { playDtmfSidetoneIos } from "./dtmfSidetoneIos.ts";
 import {
@@ -798,6 +800,8 @@ export const SoftphoneProvider: React.FC<{ children: React.ReactNode }> = ({
       if (nextState !== "active" || previousState === "active") {
         return;
       }
+
+      markIosAppForegrounded();
 
       const lastBackgroundAt = lastBackgroundAtRef.current;
       if (!lastBackgroundAt) {
@@ -2128,6 +2132,29 @@ export const SoftphoneProvider: React.FC<{ children: React.ReactNode }> = ({
               const safeName = String(name || "").trim();
               if (!safeHandle || !safeUUID) return;
 
+              const staleOutbound = shouldBlockStaleOutboundStartAction({
+                callUUID: safeUUID,
+                handle: safeHandle,
+                hasLiveSipSession: !!getSipSession(safeUUID)
+              });
+              if (staleOutbound.blocked) {
+                iosCallFlowLog(
+                  "outbound.callkit",
+                  "start handler ignored — stale replay",
+                  {
+                    callUUID: safeUUID,
+                    handle: safeHandle,
+                    reason: staleOutbound.reason
+                  }
+                );
+                try {
+                  CallKeep.endCall(safeUUID);
+                } catch {
+                  // ignore
+                }
+                return;
+              }
+
               if (isOutboundStartupGraceActive()) {
                 iosCallFlowLog(
                   "outbound.callkit",
@@ -2369,6 +2396,7 @@ export const SoftphoneProvider: React.FC<{ children: React.ReactNode }> = ({
       }
 
       if (next === "active" && prev !== "active") {
+        markIosAppForegrounded();
         iosCallFlowLog(
           "foreground-sip",
           "became active — ensure SessionManager (call notifs off)",

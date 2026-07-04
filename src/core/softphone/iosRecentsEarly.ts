@@ -13,6 +13,8 @@ export type PendingRecentsStart = {
   handle: string;
   /** CallKit contact name when present (CXStartCallAction.contactIdentifier). */
   name?: string;
+  /** When this start was queued — used to drop stale items on flush. */
+  queuedAt?: number;
 };
 
 let globalPendingRecents: PendingRecentsStart[] = [];
@@ -81,6 +83,7 @@ export function installRecentsEarlyCapture(): void {
     globalPendingRecents.push({
       callUUID: raw,
       handle,
+      queuedAt: Date.now(),
       ...(name ? { name } : {})
     });
     while (globalPendingRecents.length > MAX_QUEUE) {
@@ -147,7 +150,7 @@ export async function pullNativePendingRecentsIntent(): Promise<PendingRecentsSt
     console.warn(
       `[iosRecentsEarly] pulled native pending Recents (NSUserDefaults) uuid=${callUUID} nameLen=${name.length}`
     );
-    return { callUUID, handle, ...(name ? { name } : {}) };
+    return { callUUID, handle, queuedAt: Date.now(), ...(name ? { name } : {}) };
   } catch {
     return null;
   }
