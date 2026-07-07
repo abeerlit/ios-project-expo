@@ -1,6 +1,5 @@
 import React, {
   useState,
-  useEffect,
   useMemo,
   useCallback,
   useRef
@@ -23,7 +22,6 @@ import { useSoftphone } from "core/softphone/useSoftphone.ts";
 import { iosCallFlowLog } from "core/softphone/iosCallFlowLog.ts";
 import Icon from "shared/components/Icon.tsx";
 import { phoneNumberFormatter } from "shared/utils/utils.ts";
-import { mmkvStorage } from "store/utils/storage.ts";
 import { useSelector } from "react-redux";
 import { State } from "store/types.ts";
 import { Avatar } from "shared/components/Avatar.tsx";
@@ -83,7 +81,6 @@ function KeypadButton({ digit, letters, onPress }: KeypadButtonProps) {
   );
 }
 
-const LAST_DIALED_NUMBER_KEY = "lastDialedNumber";
 const MAX_PREVIEW_RESULTS = 2;
 
 export function DialerKeypad() {
@@ -91,7 +88,6 @@ export function DialerKeypad() {
   const navigation = useNavigation();
   const inputRef = useRef<TextInput>(null);
   const [phoneNumber, setPhoneNumber] = useState("");
-  const [lastDialedNumber, setLastDialedNumber] = useState("");
   const { makeCall, isInitializing, isRegistering, activeCallId } =
     useSoftphone();
 
@@ -218,22 +214,6 @@ export function DialerKeypad() {
     setPhoneNumber(contact.number.replace(/\D/g, ""));
   }, []);
 
-  // Load last dialed number on component mount
-  useEffect(() => {
-    const loadLastDialedNumber = async () => {
-      try {
-        const savedNumber = await mmkvStorage.getItem(LAST_DIALED_NUMBER_KEY);
-        if (savedNumber) {
-          setLastDialedNumber(savedNumber);
-        }
-      } catch (error) {
-        console.error("Error loading last dialed number:", error);
-      }
-    };
-
-    loadLastDialedNumber();
-  }, []);
-
   const handleKeypadPress = (digit: string) => {
     if (phoneNumber.length < 15) {
       setPhoneNumber((prev) => prev + digit);
@@ -276,10 +256,6 @@ export function DialerKeypad() {
     const numberToCall = phoneNumber.trim();
 
     if (!numberToCall) {
-      if (!lastDialedNumber) {
-        return;
-      }
-      setPhoneNumber(lastDialedNumber);
       return;
     }
 
@@ -312,14 +288,8 @@ export function DialerKeypad() {
         ...(contactInfo?.avatarPath ? { avatarPath: contactInfo.avatarPath } : {})
       });
 
-      // Save as last dialed number if it's a new number
-      if (phoneNumber.trim()) {
-        await mmkvStorage.setItem(LAST_DIALED_NUMBER_KEY, numberToCall);
-        setLastDialedNumber(numberToCall);
-      }
-
       // Clear the input field
-      setPhoneNumber(""); 
+      setPhoneNumber("");
     } catch (error) {
       const msg = error instanceof Error ? error.message : String(error);
       iosCallFlowLog("UI.DialerKeypad", "makeCall threw", {
@@ -523,7 +493,7 @@ export function DialerKeypad() {
           type="primary"
           onPress={handleCall}
           disabled={
-            (!phoneNumber.trim() && !lastDialedNumber) ||
+            !phoneNumber.trim() ||
             isInitializing ||
             isRegistering ||
             activeCallId === "dialing"
@@ -535,7 +505,7 @@ export function DialerKeypad() {
             styles.callButton,
             {
               backgroundColor:
-                !phoneNumber.trim() && !lastDialedNumber
+                !phoneNumber.trim()
                   ? theme.colors["color-colors-background-bg-disabled"]
                   : theme.colors[
                       "color-component-colors-components-buttons-primary-button-primary-bg"
