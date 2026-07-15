@@ -22,6 +22,49 @@ class NotificationService: UNNotificationServiceExtension {
         return nil
     }
 
+    /// Mirrors src/core/notifications/staleVoipMissedCallFallback.ts — keep the two in sync.
+    /// Server missed-call pushes carry NO callerName/callerNumber; the caller identity is the
+    /// APNs alert TITLE ("1015") and the body is boilerplate ("Missed call").
+    private func isMissedCallBoilerplate(_ text: String) -> Bool {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return t == "missed call" || t == "you have a missed call"
+    }
+
+    private func isUnknownSentinel(_ text: String) -> Bool {
+        let t = text.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return ["unknown", "unknown caller", "unknown number", "anonymous", "private", "restricted"]
+            .contains(t)
+    }
+
+    private func pickCaller(_ value: Any?) -> String? {
+        guard let s = value as? String else { return nil }
+        let t = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if t.isEmpty || isMissedCallBoilerplate(t) || isUnknownSentinel(t) { return nil }
+        return t
+    }
+
+    private func isMissedCallNotification(_ userInfo: [AnyHashable: Any]) -> Bool {
+        if (userInfo["vm_payload_type"] as? String) == "missed_call" { return true }
+        guard let click = smsClickAction(from: userInfo) else { return false }
+        return ["CALL-EVENT-MISSED", "MISSED-CALL", "missed-call", "MISSED-CALL-RECEIVED"]
+            .contains(click)
+    }
+
+    /// Resolves the caller shown under "Missed Call". Prefers explicit keys, then the alert title.
+    private func resolveMissedCallCaller(
+        userInfo: [AnyHashable: Any],
+        alertTitle: String
+    ) -> String {
+        for key in ["callerName", "caller_name", "displayName", "name",
+                    "callerNumber", "caller_number", "handle", "from"] {
+            if let picked = pickCaller(userInfo[key]) { return picked }
+            if let data = userInfo["data"] as? [String: Any],
+               let picked = pickCaller(data[key]) { return picked }
+        }
+        if let picked = pickCaller(alertTitle) { return picked }
+        return "Unknown caller"
+    }
+
     /// Mirrors RCTVoxoNotificationsModule — sendbird may be at root, under `data`, or a JSON string.
     private func sendbirdDict(from userInfo: [AnyHashable: Any]) -> [String: Any]? {
         var sb: Any? = userInfo["sendbird"]
@@ -200,6 +243,23 @@ class NotificationService: UNNotificationServiceExtension {
 
         guard let bestAttemptContent = bestAttemptContent else {
             contentHandler(request.content)
+            return
+        }
+
+        // Missed call: server sends { title: "<caller>", body: "Missed call" }, which iOS would
+        // draw caller-on-top. Flip it to match the foreground/Notifee banner exactly:
+        //   title = "Missed Call", body = "<caller>"
+        // Without this the banner layout differs between foreground and background/killed,
+        // because willPresentNotification only fires in foreground.
+        if isMissedCallNotification(request.content.userInfo) {
+            let caller = resolveMissedCallCaller(
+                userInfo: request.content.userInfo,
+                alertTitle: request.content.title
+            )
+            bestAttemptContent.title = "Missed Call"
+            bestAttemptContent.body = caller
+            NSLog("📞 [NSE] Missed call — title=Missed Call body=%@", caller)
+            contentHandler(bestAttemptContent)
             return
         }
 

@@ -9,6 +9,10 @@ const FALLBACK_DELAY_MS = 5_000;
 const MISSED_CALL_LABEL_RE =
   /^(missed call|you have a missed call)$/i;
 
+
+const UNKNOWN_SENTINEL_RE =
+  /^(unknown|unknown caller|unknown number|anonymous|private|restricted)$/i;
+
 function parseNameFromMissedCallPhrase(text: string): string | null {
   const trimmed = text.trim();
   const match = trimmed.match(/^missed call from\s+(.+)$/i);
@@ -19,12 +23,16 @@ function isMissedCallBoilerplate(text: string): boolean {
   return MISSED_CALL_LABEL_RE.test(text.trim());
 }
 
+function isUnknownSentinel(text: string): boolean {
+  return UNKNOWN_SENTINEL_RE.test(text.trim());
+}
+
 function pickCallerString(value: unknown): string | null {
   if (typeof value !== "string") {
     return null;
   }
   const trimmed = value.trim();
-  if (!trimmed || isMissedCallBoilerplate(trimmed)) {
+  if (!trimmed || isMissedCallBoilerplate(trimmed) || isUnknownSentinel(trimmed)) {
     return null;
   }
   const parsed = parseNameFromMissedCallPhrase(trimmed);
@@ -64,10 +72,28 @@ export function resolveMissedCallCallerLabel(
     }
   }
 
-  const numberKeys = ["callerNumber", "caller_number", "payload_callerNumber", "handle"];
+
+  const titleIsCallerIdentity =
+    typeof sources.body === "string" && isMissedCallBoilerplate(sources.body);
+  if (titleIsCallerIdentity) {
+    const picked = pickCallerString(sources.title);
+    if (picked) {
+      return picked;
+    }
+  }
+
+  const numberKeys = [
+    "callerNumber",
+    "caller_number",
+    "payload_callerNumber",
+    "payload_handle",
+    "handle",
+    "from",
+    "remoteHandle"
+  ];
   for (const key of numberKeys) {
     const picked = pickCallerString(sources[key]);
-    if (picked && picked !== "Unknown" && picked !== "Unknown Number") {
+    if (picked) {
       return picked;
     }
   }
@@ -83,9 +109,9 @@ export function resolveMissedCallCallerLabelFromVoipCall(
       ? (callData.payload as Record<string, unknown>)
       : {};
   return resolveMissedCallCallerLabel({
-    callerName: callData.callerName,
-    callerNumber: callData.callerNumber,
-    ...payload
+    ...payload,
+    ...(callData.callerName ? { callerName: callData.callerName } : {}),
+    ...(callData.callerNumber ? { callerNumber: callData.callerNumber } : {})
   });
 }
 
