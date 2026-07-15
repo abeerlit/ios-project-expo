@@ -196,6 +196,25 @@ export function InCallScreen({ callId, embedded = false }: InCallScreenProps) {
       : "");
   const avatarPath =
     activeCall?.contactAvatarPath ?? contactInfo?.avatarPath ?? undefined;
+  
+  let avatarName: string | undefined = undefined;
+  let avatarCustomIcon: string | undefined = undefined;
+  
+  if (activeCall?.contactDisplayName) {
+    avatarName = activeCall.contactDisplayName;
+  } else if (contactInfo?.name) {
+    avatarName = contactInfo.name;
+  } else if (phoneNumber) {
+    const digits = phoneNumber.replace(/\D/g, '');
+    
+    if (digits.length === 11 && digits[0] === '1') {
+      avatarCustomIcon = `+1${digits[1]}`;
+    } else if (digits.length === 10) {
+      avatarCustomIcon = `+1${digits[0]}`;
+    } else if (digits.length > 0) {
+      avatarCustomIcon = `+${digits.slice(0, 2)}`;
+    }
+  }
 
   const handleMute = async () => {
     if (!currentCallId || !activeCall) return;
@@ -539,9 +558,21 @@ export function InCallScreen({ callId, embedded = false }: InCallScreenProps) {
 
   if (!activeCall) {
     const destination = route.params?.destination?.trim() || "";
-    const shellName = (route.params?.displayName || destination || "Calling").trim();
+    const shellName = route.params?.displayName?.trim() || "";
     const shellAvatar = route.params?.avatarPath || null;
     const showDialingShell = !!destination;
+    
+    let shellCustomIcon: string | undefined = undefined;
+    if (!shellName && destination) {
+      const digits = destination.replace(/\D/g, '');
+      if (digits.length === 11 && digits[0] === '1') {
+        shellCustomIcon = `+1${digits[1]}`;
+      } else if (digits.length === 10) {
+        shellCustomIcon = `+1${digits[0]}`;
+      } else if (digits.length > 0) {
+        shellCustomIcon = `+${digits.slice(0, 2)}`;
+      }
+    }
 
     if (!showDialingShell) {
       const isConnecting = !!activeCallId;
@@ -614,6 +645,7 @@ export function InCallScreen({ callId, embedded = false }: InCallScreenProps) {
             size={80}
             borderRadius={borderRadius.full}
             name={shellName}
+            customIcon={shellCustomIcon}
             source={shellAvatar || undefined}
           />
           <WhiteSpace height={padding.xl} />
@@ -756,7 +788,8 @@ export function InCallScreen({ callId, embedded = false }: InCallScreenProps) {
         <Avatar
           size={80}
           borderRadius={borderRadius.full}
-          name={displayName}
+          name={avatarName}
+          customIcon={avatarCustomIcon}
           source={avatarPath || undefined}
         />
         <WhiteSpace height={padding.xl} />

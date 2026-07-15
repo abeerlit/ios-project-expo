@@ -113,65 +113,6 @@ export const DynamicChatHeader = ({
     [directoryFromState, companyContacts, personalContacts]
   );
 
-  const handleHeaderCall = useCallback(
-    async (phoneNumber: string | null) => {
-      if (!phoneNumber) {
-        toast.error("No phone number available for this contact");
-        return;
-      }
-      if (isInitializing || isRegistering) {
-        toast.error("Softphone is still initializing...");
-        return;
-      }
-      if (
-        activeCallId &&
-        activeCallId !== "testing"
-      ) {
-        iosCallFlowLog("UI.DynamicChatHeader", "BLOCKED new call — in progress", {
-          activeCallId
-        });
-        Alert.alert(
-          "Call in progress",
-          "Please end the current call before making a new one."
-        );
-        return;
-      }
-      try {
-        const maybeDisplayName =
-          memberInfo?.name ||
-          (displaySmsHeaderInfo?.firstDisplayName
-            ? displaySmsHeaderInfo.firstDisplayName
-            : undefined);
-
-        //@ts-ignore
-        navigation.navigate("InCallScreen" as any, {
-          callId: "dialing",
-          destination: phoneNumber,
-          ...(maybeDisplayName ? { displayName: maybeDisplayName } : {}),
-          ...(memberInfo?.avatar ? { avatarPath: memberInfo.avatar } : {})
-        });
-
-        void makeCall(phoneNumber, {
-          ...(maybeDisplayName ? { displayName: maybeDisplayName } : {}),
-          ...(memberInfo?.avatar ? { avatarPath: memberInfo.avatar } : {})
-        });
-      } catch {
-        onCallFailed?.();
-        toast.error("Failed to make call");
-      }
-    },
-    [
-      makeCall,
-      isInitializing,
-      isRegistering,
-      activeCallId,
-      navigation,
-      onCallFailed,
-      memberInfo?.name,
-      memberInfo?.avatar,
-      displaySmsHeaderInfo?.firstDisplayName
-    ]
-  );
 
   // Cache SMS header info to prevent flicker during message sending
   const cachedSmsHeaderRef = useRef<{
@@ -281,6 +222,88 @@ export const DynamicChatHeader = ({
       name: (first as any)?.name || ""
     };
   }, [channel?.members, channel, user, contactsForAvatar]);
+
+  const handleHeaderCall = useCallback(
+    async (phoneNumber: string | null) => {
+      if (!phoneNumber) {
+        toast.error("No phone number available for this contact");
+        return;
+      }
+      if (isInitializing || isRegistering) {
+        toast.error("Softphone is still initializing...");
+        return;
+      }
+      if (
+        activeCallId &&
+        activeCallId !== "testing"
+      ) {
+        iosCallFlowLog("UI.DynamicChatHeader", "BLOCKED new call — in progress", {
+          activeCallId
+        });
+        Alert.alert(
+          "Call in progress",
+          "Please end the current call before making a new one."
+        );
+        return;
+      }
+      try {
+        let maybeDisplayName: string | undefined = undefined;
+        let maybeAvatarPath: string | undefined = undefined;
+
+        // First check if we have a Voxo user (memberInfo)
+        if (memberInfo?.name) {
+          maybeDisplayName = memberInfo.name;
+          maybeAvatarPath = memberInfo.avatar || undefined;
+        } else {
+          // For non-Voxo users, look up in contacts
+          const contactInfo = findContactByPhoneNumber(
+            phoneNumber,
+            personalContacts,
+            companyContacts,
+            directoryFromState,
+            phoneContacts
+          );
+          
+          if (contactInfo) {
+            maybeDisplayName = contactInfo.name;
+            maybeAvatarPath = contactInfo.avatarPath || undefined;
+          }
+          // If no contact found, don't pass displayName (let it fall back to phone number in InCallScreen)
+        }
+
+        //@ts-ignore
+        navigation.navigate("InCallScreen" as any, {
+          callId: "dialing",
+          destination: phoneNumber,
+          ...(maybeDisplayName ? { displayName: maybeDisplayName } : {}),
+          ...(maybeAvatarPath ? { avatarPath: maybeAvatarPath } : {})
+        });
+
+        void makeCall(phoneNumber, {
+          ...(maybeDisplayName ? { displayName: maybeDisplayName } : {}),
+          ...(maybeAvatarPath ? { avatarPath: maybeAvatarPath } : {})
+        });
+      } catch {
+        onCallFailed?.();
+        toast.error("Failed to make call");
+      }
+    },
+    [
+      makeCall,
+      isInitializing,
+      isRegistering,
+      activeCallId,
+      navigation,
+      onCallFailed,
+      memberInfo?.name,
+      memberInfo?.avatar,
+      displaySmsHeaderInfo?.firstDisplayName,
+      personalContacts,
+      companyContacts,
+      directoryFromState,
+      phoneContacts
+    ]
+  );
 
   const searchInputRef = useRef<RNTextInput>(null);
 
