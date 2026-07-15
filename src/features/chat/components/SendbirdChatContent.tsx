@@ -201,6 +201,7 @@ export const SendbirdChatContent: React.FC<SendbirdChatContentProps> = ({
   const [listReady, setListReady] = useState(false);
   const editorRef = useRef<any>(null);
   const suppressAutoFocusUntilRef = useRef(0);
+  const autoFocusedChannelRef = useRef<string | null>(null);
 
   React.useEffect(() => {
     componentMountTime.current = Date.now();
@@ -786,9 +787,11 @@ export const SendbirdChatContent: React.FC<SendbirdChatContentProps> = ({
     const url = channelUrl || currentChannel?.url;
     const isAutoFocusSuppressed = Date.now() < suppressAutoFocusUntilRef.current;
     if (!url || !listReady || isDrawerOpen || isAutoFocusSuppressed) return;
+    if (autoFocusedChannelRef.current === url) return;
 
     const ed = editorRef.current;
     if (!ed) return;
+    autoFocusedChannelRef.current = url;
 
     if (Platform.OS === "ios") {
       const timer = setTimeout(() => ed.focus(), 400);
