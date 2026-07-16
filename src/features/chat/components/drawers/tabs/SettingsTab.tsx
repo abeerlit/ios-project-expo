@@ -134,7 +134,9 @@ export const SettingsTab = () => {
           variant={"text"}
           style={styles.channelNameInput}
           value={channelName}
-          onChangeText={setChannelName}
+          onChangeText={(value) => {
+            setChannelName(value.replace(" ", "-"));
+          }}
         />
       </View>
       <WhiteSpace height={padding.xl} />
