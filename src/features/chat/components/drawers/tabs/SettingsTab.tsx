@@ -34,7 +34,8 @@ export const SettingsTab = () => {
   const {
     currentChannel: channel,
     leaveChannelPermanently,
-    deleteChannel
+    deleteChannel,
+    updateChannelDetails
   } = useSendbirdContext();
   const theme = useTheme();
   const { closeDrawer } = useDrawer();
@@ -81,8 +82,7 @@ export const SettingsTab = () => {
     if (!channel) return;
     if (channel.data === description && channel.name === channelName) return;
     try {
-      await channel.updateChannel({ name: channelName, data: description });
-      logger.debug("Channel description updated: ", channel?.name);
+      await updateChannelDetails(channel, { name: channelName, data: description });
       closeDrawer();
       toast.success("Channel updated successfully");
     } catch (error) {

@@ -54,6 +54,7 @@ interface SendbirdContextData {
   ) => Promise<void>;
   leaveChannelPermanently: (channel: GroupChannel) => Promise<void>;
   deleteChannel: (channel: GroupChannel) => Promise<void>;
+  updateChannelDetails: ( channel: GroupChannel, params: { name: string; data: string }) => Promise<void>;
   reactionEvent: (
     message: BaseMessage,
     reaction: string,
@@ -137,6 +138,7 @@ export const SendbirdContext = createContext<SendbirdContextData>({
   deleteUserMessage: async () => {},
   leaveChannelPermanently: async () => {},
   deleteChannel: async () => {},
+  updateChannelDetails: async () => {},
   reactionEvent: async () => {},
   fetchMoreMessages: async () => {},
   fetchNewMessages: async () => {},
