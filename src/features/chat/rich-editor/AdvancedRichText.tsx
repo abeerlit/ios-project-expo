@@ -210,6 +210,11 @@ export const AdvancedRichText: React.FC<AdvancedRichTextProps> = ({
         ]}
         onPress={() => {
           editor.focus();
+          if (Platform.OS === "ios") {
+            requestAnimationFrame(() => {
+              setTimeout(() => editor.focus(), 80);
+            });
+          }
         }}
       >
         <RichText
