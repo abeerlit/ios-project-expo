@@ -16,7 +16,9 @@ import { agentStatusDrawerStyles } from "../styles/component-styles.ts";
 
 // API Import
 import { getTenantSettings } from "shared/api/tenant/methods.ts";
+import { queueAgentDND, queueAgentLogin } from "shared/api/queues/methods.ts";
 import { Logger } from "shared/utils/Logger.ts";
+import { toast } from "@backpackapp-io/react-native-toast";
 
 interface DrawerProps {
   handleStatusChange?: (
@@ -24,12 +26,16 @@ interface DrawerProps {
     paused: 1 | 0,
     pauseReason: string
   ) => Promise<void>;
+  queues?: { queueId: number; dnd: number }[]; // agent's queues + DND state
+  refetch?: () => Promise<void>;
 }
 
 const logger = new Logger("AgentStatusDrawer");
 
 export const AgentStatusDrawer: React.FC<DrawerProps> = ({
-  handleStatusChange = () => Promise.resolve()
+  handleStatusChange = () => Promise.resolve(),
+  queues = [],
+  refetch = () => Promise.resolve()
 }) => {
   // Hooks
   const theme = useTheme();
@@ -40,6 +46,13 @@ export const AgentStatusDrawer: React.FC<DrawerProps> = ({
   // State
   const [pauseReasons, setPauseReasons] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
+  const [queueLoginBusy, setQueueLoginBusy] = useState(false);
+
+  // "Logged out of all queues" is modelled as DND on every queue, because the
+  // per-queue DND state persists and round-trips via agent-status (the queue
+  // login flag does not). All queues muted => treated as logged out.
+  const hasQueues = queues.length > 0;
+  const allQueuesDnd = hasQueues && queues.every((q) => q.dnd === 1);
 
   // Fetch tenant settings on mount
   useEffect(() => {
@@ -87,6 +100,54 @@ export const AgentStatusDrawer: React.FC<DrawerProps> = ({
     } catch (error) {
       logger.error("Failed to change agent status:", error);
     } finally {
+      closeDrawer();
+    }
+  };
+
+  // Log the agent in/out of ALL their queues at once by toggling DND on every
+  // queue. Currently muted => turn DND off (log in); otherwise => turn DND on.
+  const handleQueueLoginToggle = async (): Promise<void> => {
+    if (!user?.peerName) {
+      logger.error("Cannot toggle queues: No peer name available");
+      return;
+    }
+    if (queueLoginBusy || !hasQueues) {
+      return;
+    }
+    const peerName = user.peerName;
+    const nextDnd = !allQueuesDnd; // true = mute all, false = unmute all
+    try {
+      setQueueLoginBusy(true);
+      if (accessToken) {
+        try {
+          await queueAgentLogin(accessToken, peerName, 1);
+        } catch (loginError) {
+          logger.error("ensure-login before DND failed:", loginError);
+        }
+      }
+      const results = await Promise.allSettled(
+        queues.map((q) => queueAgentDND(peerName, q.queueId, nextDnd))
+      );
+      const failed = results.filter((r) => r.status === "rejected").length;
+      if (failed > 0) {
+        toast.error(
+          `Couldn't update ${failed} of ${queues.length} queues`
+        );
+      } else {
+        toast.success(
+          nextDnd
+            ? "Logged out of all queues."
+            : "Logged in to all queues."
+        );
+      }
+    } catch (error) {
+      logger.error("Failed to toggle all queues:", error);
+      toast.error("Couldn't update queue settings");
+    } finally {
+      // Always refetch so the UI reflects the true per-queue state, even on
+      // partial failure.
+      await refetch();
+      setQueueLoginBusy(false);
       closeDrawer();
     }
   };
@@ -185,6 +246,54 @@ export const AgentStatusDrawer: React.FC<DrawerProps> = ({
             </TouchableOpacity>
           </View>
         ))
+      )}
+
+      <WhiteSpace
+        style={[
+          agentStatusDrawerStyles.divider,
+          { borderColor: theme.colors["color-colors-border-border-secondary"] }
+        ]}
+      />
+
+      {hasQueues && (
+        <View
+          style={{
+            width: "100%",
+            paddingHorizontal: 16,
+            marginTop: 4,
+            marginBottom: 8
+          }}
+        >
+          <TouchableOpacity
+            disabled={queueLoginBusy}
+            onPress={handleQueueLoginToggle}
+            activeOpacity={0.8}
+            style={{
+              alignSelf: "center",
+              width: "100%",
+              borderRadius: 12,
+              borderWidth: 1,
+              borderColor: allQueuesDnd ? "#000000" : "#dc2626",
+              backgroundColor: "#FFFFFF",
+              paddingVertical: 14,
+              paddingHorizontal: 20,
+              alignItems: "center",
+              justifyContent: "center",
+              opacity: queueLoginBusy ? 0.5 : 1
+            }}
+          >
+            <Text
+              size={fontSize.sm}
+              weight="semiBold"
+              align="center"
+              style={{ color: allQueuesDnd ? "#000000" : "#DC2626" }}
+            >
+              {allQueuesDnd
+                ? "Login to all queues"
+                : "Logout of all queues"}
+            </Text>
+          </TouchableOpacity>
+        </View>
       )}
     </View>
   );

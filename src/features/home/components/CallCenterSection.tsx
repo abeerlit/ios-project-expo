@@ -40,6 +40,7 @@ const CallCenterSection: React.FC<CallCenterSectionProps> = ({
         status={
           typeof data?.paused === "boolean" ? (data.paused ? 1 : 0) : undefined
         }
+        queues={data?.queues ?? []}
         refetch={handleRefetch}
       />
     }

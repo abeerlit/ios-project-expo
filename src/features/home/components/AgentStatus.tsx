@@ -16,6 +16,7 @@ import { toast } from "@backpackapp-io/react-native-toast";
 
 interface AgentStatusProps {
   status?: number; // 0 for Available, 1 for Off Duty
+  queues?: { queueId: number; dnd: number }[]; // agent's queues + DND state
   refetch?: () => Promise<void>;
 }
 
@@ -23,6 +24,7 @@ const logger = new Logger("AgentStatus");
 
 export const AgentStatus: React.FC<AgentStatusProps> = ({
   status = 0,
+  queues = [],
   refetch = () => Promise.resolve()
 }) => {
   // Hooks
@@ -48,13 +50,14 @@ export const AgentStatus: React.FC<AgentStatusProps> = ({
   );
 
   const handleStatusPress = useCallback(() => {
-    openDrawer(<AgentStatusDrawer handleStatusChange={handleStatusChange} />);
-  }, [openDrawer, handleStatusChange]);
+    openDrawer(
+      <AgentStatusDrawer handleStatusChange={handleStatusChange} queues={queues} refetch={refetch} />);
+  }, [openDrawer, handleStatusChange, queues, refetch]);
 
   const isAvailable = status === 0;
   const statusColor = isAvailable
-    ? theme.colors.success
-    : theme.colors.secondary;
+      ? theme.colors.success
+      : theme.colors.secondary;
   const textColor = isAvailable
     ? "color-component-colors-components-buttons-tertiary-color-button-tertiary-color-fg"
     : "secondary";
