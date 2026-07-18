@@ -110,7 +110,7 @@ export default ({ config }: ConfigContext): ExpoConfig => {
       backgroundColor: splashBackground
     },
     ios: {
-      supportsTablet: false,
+      supportsTablet: true,
       bundleIdentifier: bundleId,
       buildNumber: iosBuildNumber,
       icon: iconPath,
