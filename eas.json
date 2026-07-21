@@ -35,8 +35,8 @@
         "image": "macos-sequoia-15.6-xcode-26.2"
       },
       "env": {
-        "APP_VERSION": "2.1.12",
-        "IOS_BUILD_NUMBER": "11",
+        "APP_VERSION": "2.3.3",
+        "IOS_BUILD_NUMBER": "5",
         "EXPO_PUBLIC_NATIVE_TELEPHONY": "1",
         "EXPO_PUBLIC_NATIVE_NOTIFICATIONS": "1",
         "EXPO_PUBLIC_MEETINGS_NATIVE": "1",
